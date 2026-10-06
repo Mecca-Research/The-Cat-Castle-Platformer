@@ -4,7 +4,9 @@ Climb the atrium as Olive. Run the cushions, jump the gap, and take the salmon a
 
 **Play in the browser:** [https://mecca-research.github.io/The-Cat-Castle-Platformer/](https://mecca-research.github.io/The-Cat-Castle-Platformer/)
 
-The play link goes live after Pages is switched on once: open [Settings → Pages](https://github.com/Mecca-Research/The-Cat-Castle-Platformer/settings/pages) and set **Source** to **GitHub Actions**. Pushes to `main` then publish the game.
+That address used to open Dwarf Lord, because the user site’s missing-page file sends every unknown path there. The game is published at this path now.
+
+If this repository’s Pages setting still says it is disabled, choose **Deploy from a branch**, branch **gh-pages**, folder **/ (root)**, then save. The playable site is already on that branch.
 
 ## Controls
 
