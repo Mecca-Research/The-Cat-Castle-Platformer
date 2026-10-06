@@ -1,6 +1,6 @@
 import { sparkle } from "./scene.ts";
 
-type Kind = "puff" | "ring" | "streak" | "spark" | "heart" | "fibre";
+type Kind = "puff" | "ring" | "spark" | "heart" | "fibre";
 
 type Particle = {
   kind: Kind;
@@ -17,7 +17,37 @@ type Particle = {
 
 const TAU = Math.PI * 2;
 
-/** Short-lived effects in world space: dust, wind, glints and hearts. */
+let puffSprite: HTMLCanvasElement | null = null;
+
+/** A soft, slightly lumpy cloud, baked once and tinted by alpha. */
+function puff(): HTMLCanvasElement {
+  if (puffSprite) return puffSprite;
+  const c = document.createElement("canvas");
+  c.width = c.height = 64;
+  const g = c.getContext("2d");
+  if (g) {
+    for (const [x, y, r] of [
+      [32, 34, 20],
+      [22, 36, 13],
+      [42, 37, 14],
+      [30, 26, 13],
+      [40, 28, 10],
+    ] as const) {
+      const gr = g.createRadialGradient(x, y, 0, x, y, r);
+      gr.addColorStop(0, "rgba(255, 250, 240, 0.55)");
+      gr.addColorStop(0.6, "rgba(255, 250, 240, 0.25)");
+      gr.addColorStop(1, "rgba(255, 250, 240, 0)");
+      g.fillStyle = gr;
+      g.beginPath();
+      g.arc(x, y, r, 0, TAU);
+      g.fill();
+    }
+  }
+  puffSprite = c;
+  return c;
+}
+
+/** Short-lived effects in world space: dust, crumbs, glints and hearts. */
 export class Fx {
   private list: Particle[] = [];
 
@@ -66,19 +96,9 @@ export class Fx {
     }
   }
 
-  /** Air rushing past during a glide. */
-  streak(x: number, y: number, vx: number, vy: number) {
-    this.add({
-      kind: "streak",
-      x,
-      y,
-      vx: -vx * 18,
-      vy: -vy * 14 - 10,
-      life: 0.28 + Math.random() * 0.12,
-      size: 14 + Math.random() * 18,
-      color: "#fff7e4",
-      spin: 0,
-    });
+  /** Grains of rice flicked off the dish. */
+  crumbs(x: number, y: number, n: number) {
+    this.fibres(x, y, n, "#fff8ec");
   }
 
   sparkles(x: number, y: number, n: number, radius = 40) {
@@ -157,12 +177,9 @@ export class Fx {
     for (const p of this.list) {
       const q = p.life / p.max;
       if (p.kind === "puff") {
-        const r = p.size * (1.6 - q * 0.6);
-        g.globalAlpha = q * 0.55;
-        g.fillStyle = p.color;
-        g.beginPath();
-        g.arc(p.x, p.y, r, 0, TAU);
-        g.fill();
+        const r = p.size * (2.4 - q * 1.1);
+        g.globalAlpha = Math.min(1, q * 1.4) * 0.85;
+        g.drawImage(puff(), p.x - r, p.y - r, r * 2, r * 2);
       } else if (p.kind === "ring") {
         const r = p.size * (1.15 - q);
         g.globalAlpha = q * 0.7;
@@ -170,15 +187,6 @@ export class Fx {
         g.lineWidth = 2.2 * q + 0.4;
         g.beginPath();
         g.ellipse(p.x, p.y, r * 2.6, r * 0.55, 0, 0, TAU);
-        g.stroke();
-      } else if (p.kind === "streak") {
-        g.globalAlpha = q * 0.5;
-        g.strokeStyle = p.color;
-        g.lineWidth = 1.2;
-        const l = Math.hypot(p.vx, p.vy) || 1;
-        g.beginPath();
-        g.moveTo(p.x, p.y);
-        g.lineTo(p.x - (p.vx / l) * p.size * q, p.y - (p.vy / l) * p.size * q);
         g.stroke();
       }
     }

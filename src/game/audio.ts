@@ -102,31 +102,33 @@ export class Sound {
     this.hiss(0.1, 700, 1, 0.04, 300);
   }
 
-  /** A sustained breeze that follows the glide. */
-  setWind(level: number) {
+  /** A soft bite. */
+  nom() {
+    this.tone(220 + Math.random() * 40, 0.06, "sine", 0.05, 0, 140);
+    this.hiss(0.05, 1800, 2, 0.025);
+  }
+
+  /** A low, contented rumble. */
+  purr() {
     const ctx = this.ctx;
-    if (!ctx || !this.master || !this.noise) return;
-    if (!this.wind && level > 0.01) {
-      const src = ctx.createBufferSource();
-      src.buffer = this.noise;
-      src.loop = true;
-      const filter = ctx.createBiquadFilter();
-      filter.type = "bandpass";
-      filter.Q.value = 0.7;
-      filter.frequency.value = 700;
-      const gain = ctx.createGain();
-      gain.gain.value = 0;
-      src.connect(filter);
-      filter.connect(gain);
-      gain.connect(this.master);
-      src.start();
-      this.wind = { src, gain, filter };
-    }
-    if (this.wind) {
-      const t = ctx.currentTime;
-      this.wind.gain.gain.setTargetAtTime(level * 0.09, t, 0.08);
-      this.wind.filter.frequency.setTargetAtTime(600 + level * 900, t, 0.1);
-    }
+    if (!ctx || !this.master) return;
+    const t = ctx.currentTime;
+    const o = ctx.createOscillator();
+    o.type = "sawtooth";
+    o.frequency.value = 26;
+    const f = ctx.createBiquadFilter();
+    f.type = "lowpass";
+    f.frequency.value = 220;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.05, t + 0.3);
+    g.gain.setValueAtTime(0.05, t + 1.4);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 2.2);
+    o.connect(f);
+    f.connect(g);
+    g.connect(this.master);
+    o.start(t);
+    o.stop(t + 2.3);
   }
 
   win() {
