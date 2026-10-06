@@ -4,6 +4,8 @@ Climb the atrium as Olive. Run the cushions, jump the gap, and take the salmon a
 
 **Play in the browser:** [https://mecca-research.github.io/The-Cat-Castle-Platformer/](https://mecca-research.github.io/The-Cat-Castle-Platformer/)
 
+The play link goes live after Pages is switched on once: open [Settings → Pages](https://github.com/Mecca-Research/The-Cat-Castle-Platformer/settings/pages) and set **Source** to **GitHub Actions**. Pushes to `main` then publish the game.
+
 ## Controls
 
 | Key | Action |
