@@ -880,8 +880,15 @@ export class Scene {
         g.moveTo(x, y - 240);
         g.lineTo(x, y + 2);
         g.stroke();
+        // A slow pendulum sway from the chain.
+        const sway = Math.sin(t * 0.8 + c.worldY) * 0.012;
+        g.save();
+        g.translate(x, y - 240);
+        g.rotate(sway);
+        g.translate(-x, -(y - 240));
         drawSprite(g, this.chand, x, y);
         this.drawFlames(g, x, y, t, 1);
+        g.restore();
       }
     }
     if (this.drape) {
@@ -890,8 +897,17 @@ export class Scene {
         const wy = FLOOR_Y - 40 - i * 760;
         const y = near.y(wy) - DRAPE_H;
         if (y > view.viewH || y + DRAPE_H < 0) continue;
-        drawSprite(g, this.drape, near.x - 18, y);
-        drawSprite(g, this.drape, WORLD_W + near.x + 18, y, -1, 1);
+        // Drapes breathe in the draught: a slow skew from the rail.
+        for (const [x, dir] of [
+          [near.x - 18, 1],
+          [WORLD_W + near.x + 18, -1],
+        ] as const) {
+          const skew = Math.sin(t * 0.55 + i * 1.7 + dir) * 0.018;
+          g.save();
+          g.transform(1, 0, skew, 1, -skew * y, 0);
+          drawSprite(g, this.drape, x, y, dir, 1);
+          g.restore();
+        }
       }
     }
   }
@@ -1085,7 +1101,7 @@ export class Scene {
   }
 
   /** Floating dust, the near columns and the lens: drawn in view space. */
-  drawFront(g: CanvasRenderingContext2D, view: View, t: number, glide: number) {
+  drawFront(g: CanvasRenderingContext2D, view: View, t: number) {
     const { viewW, viewH } = view;
     this.drawShafts(g, view, t, 0.55, 2);
     if (this.mote) {
@@ -1104,7 +1120,7 @@ export class Scene {
         const near = m.d > 1.2;
         const size = m.r * (near ? 5 : 2.2) * m.d;
         const tw = 0.55 + 0.45 * Math.sin(t * m.sp * 2 + m.tw);
-        g.globalAlpha = (near ? 0.12 : 0.5) * tw * (0.6 + 0.4 * (1 - y / viewH)) + glide * 0.05;
+        g.globalAlpha = (near ? 0.12 : 0.5) * tw * (0.6 + 0.4 * (1 - y / viewH));
         drawSprite(g, this.mote, x, y, size / 16, size / 16);
       }
       g.restore();

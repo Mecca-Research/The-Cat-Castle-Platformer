@@ -1,15 +1,21 @@
 /**
- * Olive, drawn live as a vector rig: a spline body, IK legs, a spring tail and
- * a three-quarter head. Every frame the pose is blended from what the physics
- * is doing, so a run turns into a gallop, a jump into a leap, a held fall into
- * a flying-squirrel glide, and a pause into a sit.
+ * Olive, drawn live as a vector rig and animated from hand-keyed clips.
  *
- * The parts are painted into an offscreen canvas, then composited with one
- * clean silhouette outline, a soft halo and a rim of window light, so the cat
- * reads as a single illustrated shape instead of stacked pieces.
+ * Every pose is a set of channels (body placement, spine bend, paw targets,
+ * head, tail, face). Clips are keyframes on those channels, sampled with
+ * smooth Hermite curves. A small state machine blends them: idle, walk,
+ * trot and gallop by speed (phase-locked so feet stay planted), a skid on a
+ * hard reverse, a leap or a tucked hop in the air by speed and fall rate, a
+ * landing crouch, a quick turn-around, and when she is left alone a
+ * sit-down that drifts into grooming and yawning. At the end she eats the
+ * salmon.
  *
- * Local space: origin on the ground under Olive's centre, +x is the way she
- * faces, +y is down. Units are world pixels.
+ * On top of the clips run a few physical touches: planted paws lock to the
+ * floor, the head steadies itself through the gallop, and the tail, ears
+ * and collar bell swing on springs.
+ *
+ * Local space: origin on the ground under Olive's middle, +x is the way she
+ * faces, +y is down. Units are world pixels before the draw scale.
  */
 
 type V = { x: number; y: number };
@@ -33,27 +39,34 @@ const rot = (a: V, r: number): V => {
 const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
 const smooth = (t: number) => t * t * (3 - 2 * t);
 const smoothstep = (a: number, b: number, x: number) => smooth(clamp((x - a) / (b - a), 0, 1));
+const frac = (x: number) => ((x % 1) + 1) % 1;
 const wrap = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
 const TAU = Math.PI * 2;
 
+/* ------------------------------------------------------------------------ */
+/* Look                                                                      */
+/* ------------------------------------------------------------------------ */
+
 /* Palette, sampled from the photos: a brown mackerel tabby with white. */
 const C = {
-  outline: "#271e19",
-  inner: "rgba(39, 30, 25, 0.5)",
+  outline: "#2a201a",
+  inner: "rgba(42, 32, 26, 0.45)",
   tabby: "#8a7964",
-  tabbyLight: "#b2a184",
-  tabbyDark: "#62533f",
-  warm: "rgba(170, 108, 58, 0.34)",
-  stripe: "#33291f",
-  white: "#faf7f2",
-  whiteShade: "rgba(92, 84, 120, 0.2)",
-  pinkIn: "#f2c9c4",
-  pinkDeep: "#dc9a9a",
+  tabbyLight: "#b6a587",
+  tabbyDark: "#5e4f3d",
+  warm: "rgba(176, 112, 60, 0.3)",
+  stripe: "#30261e",
+  white: "#fbf8f3",
+  shade: "rgba(86, 78, 118, 0.24)",
+  pinkIn: "#f2cbc6",
+  pinkDeep: "#d99597",
   nose: "#eda5ab",
   noseDark: "#b86c78",
-  irisIn: "#e1df74",
-  irisMid: "#adc04a",
-  irisOut: "#5a7722",
+  mouth: "#4a1f22",
+  tongue: "#f08a96",
+  irisIn: "#e3e078",
+  irisMid: "#aec24b",
+  irisOut: "#587523",
   pupil: "#141a0e",
   navy: "#1f3070",
   navyDark: "#121c48",
@@ -62,74 +75,29 @@ const C = {
   dot: "#f3f5ff",
   bell: "#e6e9ee",
   bellDark: "#8a93a0",
-  rim: "#ffe3b0",
+  rim: "#ffe4b4",
 };
+
+/* ------------------------------------------------------------------------ */
+/* Skeleton                                                                  */
+/* ------------------------------------------------------------------------ */
 
 /** Leg order everywhere: far hind, near hind, far front, near front. */
-const FAR_HIND = 0;
-const NEAR_HIND = 1;
-const FAR_FRONT = 2;
-const NEAR_FRONT = 3;
+const FH = 0;
+const NH = 1;
+const FF = 2;
+const NF = 3;
 
-const FRONT_UPPER = 13.5;
-const FRONT_LOWER = 16;
-const THIGH = 13.5;
-const SHIN = 13.5;
-const META = 10;
-const PAW_R = 3.2;
-const HALF_SPINE = 24;
-const STAND_Y = -35;
-const BODY_X = -7;
+const PAW_R = 3.1;
+const F_UPPER = 14;
+const F_LOWER = 17;
+const H_THIGH = 15;
+const H_SHIN = 15;
+const H_META = 10.5;
+const HALF_SPINE = 21;
+const STAND_Y = -37;
+const BODY_X = -4;
 
-type Pose = {
-  bx: number;
-  by: number;
-  pitch: number;
-  arch: number;
-  stretch: number;
-  feet: [V, V, V, V];
-  meta: [number, number];
-  paw: [number, number, number, number];
-  neck: number;
-  headTilt: number;
-  tailRaise: number;
-  tailCurl: number;
-  tailWave: number;
-  ears: number;
-};
-
-function lerpPose(a: Pose, b: Pose, t: number): Pose {
-  if (t <= 0) return a;
-  if (t >= 1) return b;
-  return {
-    bx: lerp(a.bx, b.bx, t),
-    by: lerp(a.by, b.by, t),
-    pitch: lerp(a.pitch, b.pitch, t),
-    arch: lerp(a.arch, b.arch, t),
-    stretch: lerp(a.stretch, b.stretch, t),
-    feet: [
-      lerpV(a.feet[0], b.feet[0], t),
-      lerpV(a.feet[1], b.feet[1], t),
-      lerpV(a.feet[2], b.feet[2], t),
-      lerpV(a.feet[3], b.feet[3], t),
-    ],
-    meta: [lerp(a.meta[0], b.meta[0], t), lerp(a.meta[1], b.meta[1], t)],
-    paw: [
-      lerp(a.paw[0], b.paw[0], t),
-      lerp(a.paw[1], b.paw[1], t),
-      lerp(a.paw[2], b.paw[2], t),
-      lerp(a.paw[3], b.paw[3], t),
-    ],
-    neck: lerp(a.neck, b.neck, t),
-    headTilt: lerp(a.headTilt, b.headTilt, t),
-    tailRaise: lerp(a.tailRaise, b.tailRaise, t),
-    tailCurl: lerp(a.tailCurl, b.tailCurl, t),
-    tailWave: lerp(a.tailWave, b.tailWave, t),
-    ears: lerp(a.ears, b.ears, t),
-  };
-}
-
-/** Skeleton points derived from a body placement. */
 type Frame = { hip: V; shoulder: V; hipJoint: V; shoulderJoint: V; up: V; fwd: V };
 
 function frameOf(bx: number, by: number, pitch: number, stretch: number): Frame {
@@ -142,35 +110,81 @@ function frameOf(bx: number, by: number, pitch: number, stretch: number): Frame 
   return {
     hip,
     shoulder,
-    hipJoint: add(hip, add(mul(fwd, 4), mul(up, -5))),
-    shoulderJoint: add(shoulder, add(mul(fwd, -1), mul(up, -7))),
+    hipJoint: add(hip, add(mul(fwd, 2), mul(up, -2.5))),
+    shoulderJoint: add(shoulder, add(mul(fwd, -1), mul(up, -5))),
     up,
     fwd,
   };
 }
 
+const STAND = frameOf(BODY_X, STAND_Y, 0, 1);
+const HOME_HIND = STAND.hipJoint.x + 2;
+const HOME_FRONT = STAND.shoulderJoint.x + 1;
+
 /** Two-bone IK. `bend` +1 puts the middle joint behind (elbow), -1 ahead (knee). */
-function ik(root: V, target: V, l1: number, l2: number, bend: number): { mid: V; end: V } {
+function ik(root: V, target: V, l1: number, l2: number, bend: number) {
   const d = sub(target, root);
   const dist = clamp(len(d), Math.abs(l1 - l2) + 0.01, l1 + l2 - 0.01);
   const base = Math.atan2(d.y, d.x);
   const a = Math.acos(clamp((l1 * l1 + dist * dist - l2 * l2) / (2 * l1 * dist), -1, 1));
-  const mid = add(root, mul(rot(vec(1, 0), base + bend * a), l1));
-  const end = add(root, mul(rot(vec(1, 0), base), dist));
-  return { mid, end };
+  return {
+    mid: add(root, mul(rot(vec(1, 0), base + bend * a), l1)),
+    end: add(root, mul(rot(vec(1, 0), base), dist)),
+  };
 }
 
 /* ------------------------------------------------------------------------ */
-/* Poses                                                                     */
+/* Poses and keys                                                            */
 /* ------------------------------------------------------------------------ */
 
-const WALK_OFFSETS = [0.5, 0, 0.75, 0.25];
-const GALLOP_OFFSETS = [0.08, 0, 0.44, 0.54];
-const STAND = frameOf(BODY_X, STAND_Y, 0, 1);
-const HOME_HIND = STAND.hipJoint.x - 1;
-const HOME_FRONT = STAND.shoulderJoint.x + 1;
+type Pose = {
+  bx: number;
+  by: number;
+  pitch: number;
+  arch: number;
+  stretch: number;
+  feet: V[];
+  paw: number[];
+  meta: number[];
+  /** 1 while a paw is planted and should not slide. */
+  lock: number[];
+  neck: number;
+  head: number;
+  tailRaise: number;
+  tailCurl: number;
+  tailWave: number;
+  ears: number;
+  /** 1 open, 0 shut. */
+  eyes: number;
+  mouth: number;
+  tongue: number;
+  /** Near front paw lifted to the face (grooming), with its spot on the face. */
+  face: number;
+  faceX: number;
+  faceY: number;
+};
 
-function basePose(): Pose {
+const FIELDS = [
+  "bx",
+  "by",
+  "pitch",
+  "arch",
+  "stretch",
+  "neck",
+  "head",
+  "tailRaise",
+  "tailCurl",
+  "tailWave",
+  "ears",
+  "eyes",
+  "mouth",
+  "tongue",
+  "face",
+  "faceX",
+  "faceY",
+] as const;
+
+function base(): Pose {
   return {
     bx: BODY_X,
     by: STAND_Y,
@@ -180,198 +194,521 @@ function basePose(): Pose {
     feet: [
       vec(HOME_HIND + 4, -PAW_R),
       vec(HOME_HIND, -PAW_R),
-      vec(HOME_FRONT - 4, -PAW_R),
+      vec(HOME_FRONT - 3, -PAW_R),
       vec(HOME_FRONT, -PAW_R),
     ],
-    meta: [0.3, 0.3],
     paw: [0, 0, 0, 0],
+    meta: [0.28, 0.28],
+    lock: [1, 1, 1, 1],
     neck: 0,
-    headTilt: 0,
-    tailRaise: 0.35,
+    head: 0,
+    tailRaise: 0.45,
     tailCurl: 1.6,
     tailWave: 0.25,
     ears: 0,
+    eyes: 1,
+    mouth: 0,
+    tongue: 0,
+    face: 0,
+    faceX: 9,
+    faceY: 10,
   };
 }
 
-function strideFor(speed: number, runK: number) {
-  return lerp(lerp(6, 28, smoothstep(0, 4.6, speed)), 54, runK);
+/** Weighted blend of poses; weights need not sum to one. */
+function blend(items: [Pose, number][]): Pose {
+  let total = 0;
+  for (const [, w] of items) total += Math.max(0, w);
+  if (total <= 1e-6) return items[0]![0];
+  const out = base();
+  for (const f of FIELDS) out[f] = 0;
+  for (let i = 0; i < 4; i++) {
+    out.feet[i] = vec(0, 0);
+    out.paw[i] = 0;
+    out.lock[i] = 0;
+  }
+  out.meta = [0, 0];
+  for (const [p, raw] of items) {
+    const w = Math.max(0, raw) / total;
+    if (w === 0) continue;
+    for (const f of FIELDS) out[f] += p[f] * w;
+    for (let i = 0; i < 4; i++) {
+      out.feet[i] = add(out.feet[i]!, mul(p.feet[i]!, w));
+      out.paw[i]! += p.paw[i]! * w;
+      out.lock[i]! += p.lock[i]! * w;
+    }
+    out.meta[0]! += p.meta[0]! * w;
+    out.meta[1]! += p.meta[1]! * w;
+  }
+  return out;
 }
 
-function stanceFor(runK: number) {
-  return lerp(0.56, 0.34, runK);
+function mix(a: Pose, b: Pose, t: number): Pose {
+  if (t <= 0) return a;
+  if (t >= 1) return b;
+  return blend([
+    [a, 1 - t],
+    [b, t],
+  ]);
 }
 
-/** Walk blends into a bounding gallop as speed climbs. Feet stay planted. */
-function gaitPose(phase: number, speed: number, runK: number): Pose {
-  const p = basePose();
-  const moving = smoothstep(0.15, 1.2, speed);
-  const stride = strideFor(speed, runK);
-  const stance = stanceFor(runK);
-  const lift = lerp(6, 10, runK) * moving;
+type Keys = readonly (readonly [number, number])[];
 
-  // Spine flex for the gallop: gathered near 0, stretched out near 0.45.
-  const flex = Math.cos(TAU * (phase - 0.45));
-  p.stretch = 1 + runK * 0.13 * flex;
-  p.arch = lerp(1.5, 1.5 + 10 * Math.max(0, -flex) - 2 * Math.max(0, flex), runK);
-  p.pitch =
-    runK * -0.12 * Math.sin(TAU * phase) + moving * (1 - runK) * 0.012 * Math.sin(TAU * 2 * phase);
-  p.by = STAND_Y - moving * lerp(0.7, 4, runK) * Math.cos(TAU * 2 * (phase - 0.45)) + runK * 1;
-  p.bx = BODY_X + runK * 2;
+/**
+ * Sample scalar keyframes at `t` with a Hermite curve whose tangents come
+ * from the neighbouring keys (Catmull-Rom, aware of uneven spacing).
+ */
+function keyed(t: number, keys: Keys, loop = true): number {
+  const n = keys.length;
+  if (n === 1) return keys[0]![1];
+  if (loop) t = frac(t);
+  else {
+    if (t <= keys[0]![0]) return keys[0]![1];
+    if (t >= keys[n - 1]![0]) return keys[n - 1]![1];
+  }
+  const at = (j: number): readonly [number, number] => {
+    if (!loop) return keys[clamp(j, 0, n - 1)]!;
+    const m = ((j % n) + n) % n;
+    const lap = Math.floor(j / n);
+    return [keys[m]![0] + lap, keys[m]![1]];
+  };
+  let i = -1;
+  for (let k = 0; k < n; k++) if (keys[k]![0] <= t) i = k;
+  if (i < 0) {
+    i = n - 1;
+    t += 1;
+  }
+  const k0 = at(i - 1);
+  const k1 = at(i);
+  const k2 = at(i + 1);
+  const k3 = at(i + 2);
+  const span = k2[0] - k1[0] || 1;
+  const u = (t - k1[0]) / span;
+  const m1 = ((k2[1] - k0[1]) / (k2[0] - k0[0] || 1)) * span;
+  const m2 = ((k3[1] - k1[1]) / (k3[0] - k1[0] || 1)) * span;
+  const u2 = u * u;
+  const u3 = u2 * u;
+  return (
+    (2 * u3 - 3 * u2 + 1) * k1[1] +
+    (u3 - 2 * u2 + u) * m1 +
+    (-2 * u3 + 3 * u2) * k2[1] +
+    (u3 - u2) * m2
+  );
+}
 
+/* ------------------------------------------------------------------------ */
+/* Gaits                                                                     */
+/* ------------------------------------------------------------------------ */
+
+type Swing = { x: Keys; lift: Keys; paw: Keys; meta?: Keys };
+
+type Gait = {
+  /** How far a planted paw travels back under the body. */
+  sweep: number;
+  /** Share of the cycle each paw is planted. */
+  stance: number;
+  offsets: readonly number[];
+  front: Swing;
+  hind: Swing;
+  stanceMeta: readonly [number, number];
+  body: (phase: number, p: Pose) => void;
+};
+
+/** Distance travelled per full cycle when planted paws do not slide. */
+const cycleOf = (g: Gait) => g.sweep / g.stance;
+
+const WALK: Gait = {
+  sweep: 24,
+  stance: 0.62,
+  offsets: [0.5, 0, 0.75, 0.25],
+  front: {
+    x: [
+      [0, -0.5],
+      [0.5, 0.05],
+      [1, 0.5],
+    ],
+    lift: [
+      [0, 0],
+      [0.4, 6],
+      [0.78, 3.5],
+      [1, 0],
+    ],
+    paw: [
+      [0, -0.35],
+      [0.38, 1],
+      [0.8, 0.3],
+      [1, 0],
+    ],
+  },
+  hind: {
+    x: [
+      [0, -0.5],
+      [0.5, 0.05],
+      [1, 0.5],
+    ],
+    lift: [
+      [0, 0],
+      [0.45, 5.5],
+      [1, 0],
+    ],
+    paw: [
+      [0, -0.4],
+      [0.4, -0.7],
+      [1, 0],
+    ],
+    meta: [
+      [0, -0.35],
+      [0.45, 0.15],
+      [1, 0.35],
+    ],
+  },
+  stanceMeta: [0.38, -0.25],
+  body(phase, p) {
+    p.by = STAND_Y + 0.7 * Math.cos(TAU * 2 * phase);
+    p.pitch = 0.012 * Math.sin(TAU * 2 * phase);
+    p.neck = -0.03;
+    p.tailRaise = 1.0;
+    p.tailCurl = 1.8;
+    p.tailWave = 0.35;
+  },
+};
+
+const TROT: Gait = {
+  sweep: 36,
+  stance: 0.44,
+  offsets: [0.5, 0, 0.03, 0.53],
+  front: {
+    x: [
+      [0, -0.5],
+      [0.3, -0.28],
+      [0.7, 0.38],
+      [1, 0.5],
+    ],
+    lift: [
+      [0, 0],
+      [0.3, 9.5],
+      [0.66, 7],
+      [1, 0],
+    ],
+    paw: [
+      [0, -0.55],
+      [0.3, 1.35],
+      [0.72, 0.35],
+      [1, 0],
+    ],
+  },
+  hind: {
+    x: [
+      [0, -0.5],
+      [0.35, -0.32],
+      [0.75, 0.38],
+      [1, 0.5],
+    ],
+    lift: [
+      [0, 0],
+      [0.35, 8],
+      [0.75, 5],
+      [1, 0],
+    ],
+    paw: [
+      [0, -0.65],
+      [0.4, -0.95],
+      [0.8, 0.15],
+      [1, 0],
+    ],
+    meta: [
+      [0, -0.65],
+      [0.4, -0.2],
+      [0.8, 0.5],
+      [1, 0.42],
+    ],
+  },
+  stanceMeta: [0.45, -0.4],
+  body(phase, p) {
+    // Two bounces a cycle, lowest as each diagonal pair takes the weight.
+    p.by = STAND_Y + 1.6 * Math.cos(TAU * 2 * (phase - 0.22)) + 0.6;
+    p.pitch = 0.018 * Math.sin(TAU * 2 * phase);
+    p.arch = 1.2;
+    p.stretch = 1.02;
+    p.neck = -0.07;
+    p.tailRaise = 0.72;
+    p.tailCurl = 1.35;
+    p.tailWave = 0.5;
+    p.ears = 0.08;
+  },
+};
+
+const GALLOP: Gait = {
+  sweep: 46,
+  stance: 0.3,
+  offsets: [0.07, 0, 0.48, 0.56],
+  front: {
+    x: [
+      [0, -0.5],
+      [0.22, -0.62],
+      [0.5, -0.02],
+      [0.78, 0.74],
+      [1, 0.5],
+    ],
+    lift: [
+      [0, 0],
+      [0.22, 11],
+      [0.5, 15],
+      [0.78, 9],
+      [1, 0],
+    ],
+    paw: [
+      [0, -0.8],
+      [0.25, 1.55],
+      [0.55, 1.0],
+      [0.82, -0.15],
+      [1, 0],
+    ],
+  },
+  hind: {
+    x: [
+      [0, -0.5],
+      [0.2, -0.88],
+      [0.5, -0.15],
+      [0.8, 0.62],
+      [1, 0.5],
+    ],
+    lift: [
+      [0, 0],
+      [0.2, 12],
+      [0.5, 15],
+      [0.8, 8],
+      [1, 0],
+    ],
+    paw: [
+      [0, -0.85],
+      [0.2, -1.35],
+      [0.55, -0.2],
+      [0.85, 0.35],
+      [1, 0],
+    ],
+    meta: [
+      [0, -1.0],
+      [0.2, -1.3],
+      [0.5, 0.15],
+      [0.8, 0.72],
+      [1, 0.5],
+    ],
+  },
+  stanceMeta: [0.5, -0.65],
+  body(phase, p) {
+    // Gathered (back arched, feet bunched) near 0.9; stretched out near 0.4.
+    p.arch = keyed(phase, [
+      [0, 9],
+      [0.12, 6],
+      [0.25, 1],
+      [0.37, -4],
+      [0.5, -3],
+      [0.62, 2],
+      [0.75, 7],
+      [0.87, 11],
+    ]);
+    p.stretch = keyed(phase, [
+      [0, 0.88],
+      [0.12, 0.92],
+      [0.25, 1.03],
+      [0.37, 1.15],
+      [0.5, 1.12],
+      [0.62, 1.02],
+      [0.75, 0.92],
+      [0.87, 0.86],
+    ]);
+    p.pitch = keyed(phase, [
+      [0, 0.07],
+      [0.12, 0],
+      [0.25, -0.1],
+      [0.37, -0.07],
+      [0.5, 0.05],
+      [0.62, 0.12],
+      [0.75, 0.08],
+      [0.87, 0.05],
+    ]);
+    p.by =
+      STAND_Y +
+      2 +
+      keyed(phase, [
+        [0, 1.5],
+        [0.12, 1],
+        [0.25, -2.5],
+        [0.42, -6],
+        [0.55, 0.5],
+        [0.66, 2],
+        [0.8, -1.5],
+        [0.93, -3.5],
+      ]);
+    p.bx =
+      BODY_X +
+      keyed(phase, [
+        [0, -1],
+        [0.37, 2],
+        [0.62, 0],
+        [0.87, -2],
+      ]);
+    p.neck = -0.1;
+    p.ears = 0.38;
+    p.tailRaise = keyed(phase, [
+      [0, 0.38],
+      [0.4, 0.12],
+      [0.8, 0.45],
+    ]);
+    p.tailCurl = 0.7;
+    p.tailWave = 0.45;
+  },
+};
+
+function gaitPose(g: Gait, phase: number): Pose {
+  const p = base();
+  g.body(phase, p);
   const f = frameOf(p.bx, p.by, p.pitch, p.stretch);
   for (let i = 0; i < 4; i++) {
-    const offset = lerp(WALK_OFFSETS[i]!, GALLOP_OFFSETS[i]!, runK);
-    const s = (((phase + offset) % 1) + 1) % 1;
     const front = i >= 2;
+    const s = frac(phase + g.offsets[i]!);
     const home = front
       ? HOME_FRONT + (f.shoulderJoint.x - STAND.shoulderJoint.x)
       : HOME_HIND + (f.hipJoint.x - STAND.hipJoint.x);
+    const sw = front ? g.front : g.hind;
     let x: number;
-    let y: number;
+    let y = -PAW_R;
     let paw = 0;
-    if (s < stance) {
-      const q = s / stance;
-      x = home + stride * (0.5 - q);
-      y = -PAW_R;
-      paw = q > 0.75 ? (q - 0.75) * (front ? -1.2 : 1.6) : 0;
+    let meta = 0.3;
+    let lock = 0;
+    if (s < g.stance) {
+      const q = s / g.stance;
+      x = home + g.sweep * (0.5 - q);
+      // Toes roll off at the end of the stance.
+      paw = q > 0.72 ? (q - 0.72) * (front ? -2 : 2.4) : 0;
+      meta = lerp(g.stanceMeta[0], g.stanceMeta[1], q);
+      lock = smoothstep(0, 0.06, q) * (1 - smoothstep(0.9, 1, q));
     } else {
-      const q = (s - stance) / (1 - stance);
-      x = home + stride * (-0.5 + smooth(q));
-      y = -PAW_R - lift * Math.sin(Math.PI * q) * (front ? 1 : 0.9);
-      // Gallop: hinds kick out behind, fronts reach long before touchdown.
-      if (front) x += runK * 8 * Math.sin(Math.PI * q) * (q > 0.4 ? 1 : 0.3);
-      else x -= runK * 7 * Math.sin(Math.PI * Math.min(1, q * 1.6));
-      paw = front ? 1.1 * Math.sin(Math.PI * q) : -0.7 * Math.sin(Math.PI * q);
+      const q = (s - g.stance) / (1 - g.stance);
+      x = home + g.sweep * keyed(q, sw.x, false);
+      y = -PAW_R - keyed(q, sw.lift, false);
+      paw = keyed(q, sw.paw, false);
+      if (sw.meta) meta = keyed(q, sw.meta, false);
     }
-    if (i === FAR_HIND || i === FAR_FRONT) x += 3 * (1 - runK);
+    if (i === FH || i === FF) x += 2.5;
     p.feet[i] = vec(x, y);
-    p.paw[i] = paw * moving;
-    if (!front) {
-      const m =
-        s < stance
-          ? lerp(0.5, -0.2, s / stance)
-          : lerp(-0.55, 0.5, smooth((s - stance) / (1 - stance)));
-      p.meta[i === FAR_HIND ? 0 : 1] = lerp(0.3, m, moving);
-    }
+    p.paw[i] = paw;
+    p.lock[i] = lock;
+    if (!front) p.meta[i] = meta;
   }
-
-  p.neck = -0.04 * moving - runK * 0.08;
-  p.headTilt = -p.pitch * 0.85;
-  p.tailRaise = lerp(lerp(0.35, 0.95, moving), 0.3 + 0.12 * flex, runK);
-  p.tailCurl = lerp(lerp(1.6, 1.9, moving), 0.8, runK);
-  p.tailWave = lerp(0.25, 0.45, moving);
-  p.ears = runK * 0.3;
   return p;
 }
 
-function sitPose(): Pose {
-  // Haunch folded under, hind paws flat beneath it, front legs straight,
-  // chest up, tail laid along the floor around the feet.
-  const p = basePose();
-  p.bx = -3;
-  p.by = -25.5;
-  p.pitch = -0.85;
-  p.stretch = 0.66;
+/* ------------------------------------------------------------------------ */
+/* Still poses and clips                                                     */
+/* ------------------------------------------------------------------------ */
+
+function idlePose(t: number): Pose {
+  const p = base();
+  p.by += Math.sin(t * 2.4) * 0.35;
+  p.bx += Math.sin(t * 0.7) * 0.5;
+  p.head = Math.sin(t * 0.43) * 0.05;
+  p.neck = Math.sin(t * 0.31) * 0.03;
+  p.tailRaise = 0.45 + Math.sin(t * 0.9) * 0.08;
+  p.tailWave = 0.3;
+  return p;
+}
+
+function sitPose(t: number): Pose {
+  const p = base();
+  p.bx = -4.4;
+  p.by = -24.1 + Math.sin(t * 2.1) * 0.3;
+  p.pitch = -0.88;
+  p.stretch = 0.72;
   p.arch = 3;
-  p.feet = [vec(6, -PAW_R), vec(3, -PAW_R), vec(13, -PAW_R), vec(16.5, -PAW_R)];
+  p.feet = [vec(5, -PAW_R), vec(2, -PAW_R), vec(10, -PAW_R), vec(13.5, -PAW_R)];
   p.meta = [Math.PI / 2, Math.PI / 2];
-  p.paw = [0, 0, 0, 0];
-  p.neck = 0.3;
-  p.headTilt = 0.2;
-  p.tailRaise = -0.4;
-  p.tailCurl = -1.75;
-  p.tailWave = 0.05;
+  p.neck = 0.42;
+  p.head = 0.22 + Math.sin(t * 0.5) * 0.04;
+  p.tailRaise = -0.45;
+  p.tailCurl = -1.8 + Math.sin(t * 1.3) * 0.12;
+  p.tailWave = 0.06;
   return p;
 }
 
-/** Leaping: from push-off, through the stretch and tuck, to reaching for the landing. */
-function airPose(vy: number, vx: number): Pose {
-  const p = basePose();
-  const rise = smoothstep(-1, -9, vy);
-  const fall = smoothstep(1, 8, vy);
-  const apex = 1 - Math.max(rise, fall);
-  p.pitch = -0.28 * rise + 0.16 * fall + clamp(Math.abs(vx) * 0.01, 0, 0.05) * apex;
-  p.arch = -3 * rise + 5 * apex + 0.5 * fall;
-  p.stretch = 1 + 0.08 * rise - 0.06 * apex + 0.03 * fall;
-  p.by = STAND_Y - 2;
-  const f = frameOf(p.bx, p.by, p.pitch, p.stretch);
-  const local = (root: V, off: V) => add(root, rot(off, p.pitch * 0.4));
-
-  const pick = (r: V, a: V, fl: V) => add(add(mul(r, rise), mul(a, apex)), mul(fl, fall));
-  const hind = pick(vec(-19, 15), vec(5, 15), vec(-1, 23));
-  const front = pick(vec(12, 11), vec(7, 16), vec(11, 24));
-  p.feet = [
-    local(f.hipJoint, add(hind, vec(4, -1))),
-    local(f.hipJoint, hind),
-    local(f.shoulderJoint, add(front, vec(-4, -1))),
-    local(f.shoulderJoint, front),
-  ];
-  p.meta = [lerp(0.4, -1.1, rise) + 0.6 * apex, lerp(0.4, -1.15, rise) + 0.6 * apex];
-  p.paw = [-0.4 * rise, -0.5 * rise, 0.8 * apex + 0.4 * rise, 0.9 * apex + 0.5 * rise];
-  p.neck = -0.1 * rise + 0.06 * fall;
-  p.headTilt = -p.pitch * 0.6 + 0.12 * fall;
-  p.tailRaise = -0.25 * rise + 0.5 * apex + 0.55 * fall;
-  p.tailCurl = 0.3 * rise + 1.3 * apex + 0.9 * fall;
-  p.tailWave = 0.15;
-  p.ears = 0.25 * rise;
+/** Halfway down: hips first, front legs still straight. */
+function sitMidPose(t: number): Pose {
+  const s = sitPose(t);
+  const p = mix(idlePose(t), s, 0.5);
+  p.by = -30;
+  p.pitch = -0.42;
+  p.feet = [vec(-6, -PAW_R), vec(-9, -PAW_R), vec(12, -PAW_R), vec(15, -PAW_R)];
+  p.meta = [1.1, 1.1];
   return p;
 }
 
-/** Flying squirrel: legs spread wide, belly to the floor, tail streaming. */
-function glidePose(t: number, tired: number): Pose {
-  const p = basePose();
-  p.pitch = 0.05;
-  p.arch = -3.5;
-  p.stretch = 1.1;
-  p.by = STAND_Y - 2;
-  const f = frameOf(p.bx, p.by, p.pitch, p.stretch);
-  const k = tired * 5;
-  const w = t * 22;
-  p.feet = [
-    add(f.hipJoint, vec(-22 + Math.sin(w + 1) * k, 9 + Math.cos(w) * k)),
-    add(f.hipJoint, vec(-25 + Math.sin(w) * k, 7 + Math.cos(w + 1) * k)),
-    add(f.shoulderJoint, vec(21 + Math.sin(w + 2) * k, 9 + Math.cos(w + 3) * k)),
-    add(f.shoulderJoint, vec(25 + Math.sin(w + 3) * k, 6 + Math.cos(w + 2) * k)),
-  ];
-  p.meta = [-1.35, -1.4];
-  p.paw = [-0.9, -1, -0.3, -0.35];
-  p.neck = -0.1;
-  p.headTilt = -0.04;
-  p.tailRaise = 0.1;
-  p.tailCurl = -0.2;
-  p.tailWave = 0.75;
-  p.ears = 0.9;
+function sitDownPose(k: number, t: number): Pose {
+  if (k < 0.45) return mix(idlePose(t), sitMidPose(t), smooth(k / 0.45));
+  return mix(sitMidPose(t), sitPose(t), smooth((k - 0.45) / 0.55));
+}
+
+/** Lick a paw, then wash the face with it. */
+function groomPose(k: number, t: number): Pose {
+  const p = sitPose(t);
+  const up = smoothstep(0, 0.14, k) * (1 - smoothstep(0.9, 1, k));
+  p.face = up;
+  const lick = k > 0.14 && k < 0.6;
+  const wipe = smoothstep(0.58, 0.68, k) * (1 - smoothstep(0.86, 0.92, k));
+  const wipePath = (k - 0.62) / 0.24;
+  p.faceX = lerp(
+    lerp(8, 10, Math.sin(t * 9) * 0.5 + 0.5),
+    lerp(4, -6, frac(clamp(wipePath, 0, 0.999) * 2)),
+    wipe,
+  );
+  p.faceY = lerp(
+    11 + (lick ? Math.sin(t * 9) * 1.2 : 0),
+    lerp(4, -8, frac(clamp(wipePath, 0, 0.999) * 2)),
+    wipe,
+  );
+  p.neck += 0.16 * up;
+  p.head += (0.22 + (lick ? Math.sin(t * 9) * 0.06 : 0)) * up - 0.3 * wipe;
+  p.tongue = lick ? Math.max(0, Math.sin(t * 9)) : 0;
+  p.eyes = lerp(1, 0.25, up);
+  p.ears = 0.1 * wipe;
   return p;
 }
 
-function divePose(): Pose {
-  const p = basePose();
-  p.pitch = 0.45;
-  p.arch = 6;
-  p.stretch = 0.92;
-  p.by = STAND_Y - 2;
-  const f = frameOf(p.bx, p.by, p.pitch, p.stretch);
-  p.feet = [
-    add(f.hipJoint, vec(6, 13)),
-    add(f.hipJoint, vec(3, 15)),
-    add(f.shoulderJoint, vec(6, 15)),
-    add(f.shoulderJoint, vec(10, 17)),
-  ];
-  p.meta = [0.9, 0.9];
-  p.paw = [0.5, 0.5, 1, 1];
-  p.neck = 0.1;
-  p.headTilt = -0.25;
-  p.tailRaise = 1.0;
-  p.tailCurl = 0.5;
-  p.tailWave = 0.2;
-  p.ears = 1;
+function yawnPose(k: number, t: number): Pose {
+  const p = sitPose(t);
+  const open = smoothstep(0.1, 0.35, k) * (1 - smoothstep(0.62, 0.8, k));
+  p.mouth = open;
+  p.neck -= 0.12 * open;
+  p.head -= 0.38 * open;
+  p.eyes = 1 - open * 0.95;
+  p.ears = 0.45 * open;
+  p.by -= 1.2 * open;
+  p.tongue = smoothstep(0.8, 0.86, k) * (1 - smoothstep(0.93, 1, k));
   return p;
 }
 
-/** Bracing against a reverse: leaning back with the front paws planted ahead. */
+/** Down to the dish, three bites, then sit back and lick the lips. */
+function eatPose(k: number, t: number, standing: Pose): Pose {
+  const lean = smoothstep(0, 0.2, k) * (1 - smoothstep(0.8, 0.95, k));
+  const p = mix(standing, sitPose(t), smoothstep(0.8, 1, k));
+  p.pitch += 0.16 * lean;
+  p.by += 4 * lean;
+  p.neck += 0.62 * lean;
+  p.head += 0.32 * lean;
+  p.feet[NF] = add(p.feet[NF]!, vec(4 * lean, 0));
+  const chew = k > 0.22 && k < 0.78 ? Math.max(0, Math.sin((k - 0.22) * TAU * 5.3)) : 0;
+  p.mouth = chew * 0.75;
+  p.eyes = lerp(1, 0.6, lean);
+  p.ears = 0.15 * lean;
+  p.tongue = smoothstep(0.86, 0.9, k) * (1 - smoothstep(0.97, 1, k));
+  p.tailRaise = lerp(p.tailRaise, 0.9, lean);
+  p.tailCurl = lerp(p.tailCurl, 1.9, lean);
+  return p;
+}
+
+/** Bracing against a reverse: leaning back, front paws planted ahead. */
 function skidPose(): Pose {
-  const p = basePose();
+  const p = base();
   p.pitch = -0.1;
   p.by = STAND_Y + 4;
   p.bx = BODY_X - 3;
@@ -382,40 +719,175 @@ function skidPose(): Pose {
     vec(HOME_FRONT + 13, -PAW_R),
   ];
   p.meta = [0.7, 0.75];
-  p.paw = [0, 0, -0.3, -0.35];
-  p.tailRaise = 0.8;
+  p.paw = [0, 0, -0.35, -0.4];
+  p.lock = [0, 0, 0, 0];
+  p.tailRaise = 0.85;
   p.tailCurl = 0.6;
   p.ears = 0.5;
   return p;
 }
 
+/**
+ * In the air, keyed on fall speed. `leap` blends a stretched running leap
+ * with a tucked standing hop.
+ */
+function airPose(vy: number, leap: number, launch: number): Pose {
+  const k = (keys: Keys) => keyed(vy, keys, false);
+  const hop = base();
+  hop.pitch = k([
+    [-14, -0.32],
+    [-6, -0.18],
+    [0, 0],
+    [6, 0.1],
+    [14, 0.16],
+  ]);
+  hop.arch = k([
+    [-14, -2],
+    [-6, 2],
+    [0, 6],
+    [6, 2],
+    [14, 0],
+  ]);
+  hop.stretch = k([
+    [-14, 1.08],
+    [-6, 1],
+    [0, 0.94],
+    [6, 0.98],
+    [14, 1.02],
+  ]);
+  const run = base();
+  run.pitch = k([
+    [-14, -0.3],
+    [-6, -0.18],
+    [0, 0],
+    [6, 0.14],
+    [14, 0.22],
+  ]);
+  run.arch = k([
+    [-14, -4],
+    [-6, -3],
+    [0, 2],
+    [6, 2],
+    [14, 0],
+  ]);
+  run.stretch = k([
+    [-14, 1.14],
+    [-6, 1.12],
+    [0, 1],
+    [6, 0.98],
+    [14, 1.0],
+  ]);
+  const p = mix(hop, run, leap);
+  p.by = STAND_Y - 2;
+  const f = frameOf(p.bx, p.by, p.pitch, p.stretch);
+  const at = (root: V, off: V) => add(root, rot(off, p.pitch * 0.5));
+  const pick = (hopKeys: [number, V][], runKeys: [number, V][]) => {
+    const kx = (ks: [number, V][]) => k(ks.map(([v, o]) => [v, o.x] as const));
+    const ky = (ks: [number, V][]) => k(ks.map(([v, o]) => [v, o.y] as const));
+    return vec(lerp(kx(hopKeys), kx(runKeys), leap), lerp(ky(hopKeys), ky(runKeys), leap));
+  };
+  const front = pick(
+    [
+      [-14, vec(8, 9)],
+      [-6, vec(6, 12)],
+      [0, vec(6, 14)],
+      [6, vec(10, 25)],
+      [14, vec(12, 29)],
+    ],
+    [
+      [-14, vec(24, 2)],
+      [-6, vec(20, 6)],
+      [0, vec(16, 14)],
+      [6, vec(16, 24)],
+      [14, vec(14, 29)],
+    ],
+  );
+  const hind = pick(
+    [
+      [-14, vec(-4, 30)],
+      [-6, vec(4, 22)],
+      [0, vec(8, 16)],
+      [6, vec(2, 24)],
+      [14, vec(-2, 28)],
+    ],
+    [
+      [-14, vec(-26, 14)],
+      [-6, vec(-22, 12)],
+      [0, vec(-8, 16)],
+      [6, vec(0, 21)],
+      [14, vec(2, 26)],
+    ],
+  );
+  p.feet = [
+    at(f.hipJoint, add(hind, vec(4, -1))),
+    at(f.hipJoint, hind),
+    at(f.shoulderJoint, add(front, vec(-4, -1.5))),
+    at(f.shoulderJoint, front),
+  ];
+  const rise = smoothstep(-1, -9, vy);
+  const apex = 1 - Math.max(rise, smoothstep(1, 8, vy));
+  p.meta = [lerp(0.4, -1.1, rise * leap) + 0.5 * apex, lerp(0.4, -1.15, rise * leap) + 0.5 * apex];
+  p.paw = [-0.5 * rise, -0.6 * rise, 1.2 * apex + 0.9 * rise, 1.3 * apex + 1.0 * rise];
+  p.lock = [0, 0, 0, 0];
+  p.neck = -0.1 * rise + 0.08 * smoothstep(2, 10, vy);
+  p.head = -p.pitch * 0.6 + 0.1 * smoothstep(2, 10, vy);
+  p.tailRaise = k([
+    [-14, -0.3],
+    [-6, -0.1],
+    [0, 0.6],
+    [6, 0.9],
+    [14, 1.0],
+  ]);
+  p.tailCurl = k([
+    [-14, 0.2],
+    [0, 1.4],
+    [14, 0.7],
+  ]);
+  p.tailWave = 0.15;
+  p.ears = 0.25 * rise + 0.2 * smoothstep(6, 14, vy);
+  if (launch > 0) {
+    // Push-off: the hind paws are still driving into the cushion.
+    const L = smooth(launch);
+    p.feet[FH] = lerpV(p.feet[FH]!, vec(HOME_HIND - 8, -PAW_R + 4 * (1 - L)), L);
+    p.feet[NH] = lerpV(p.feet[NH]!, vec(HOME_HIND - 12, -PAW_R + 4 * (1 - L)), L);
+    p.meta = [lerp(p.meta[0]!, -0.6, L), lerp(p.meta[1]!, -0.7, L)];
+    p.pitch -= 0.08 * L;
+  }
+  return p;
+}
+
 /* ------------------------------------------------------------------------ */
-/* Rig state                                                                 */
+/* Rig                                                                       */
 /* ------------------------------------------------------------------------ */
 
 export type OliveDrive = {
   vx: number;
   vy: number;
   grounded: boolean;
-  gliding: boolean;
-  diving: boolean;
-  skidding: boolean;
-  /** 0..1 glide stamina left. */
-  stamina: number;
-  /** Ask Olive to sit (title card, the win). */
+  /** Reversing on the ground. */
+  turning: boolean;
+  facing: 1 | -1;
+  /** Olive's middle in world x, and the draw scale, to pin planted paws. */
+  worldX: number;
+  scale: number;
+  /** Sit and stay (title card). */
   rest: boolean;
-  /** Something is happening; breaks a sit. */
+  /** At the salmon: eat it. */
+  eat: boolean;
+  /** Input is held; breaks a sit. */
   busy: boolean;
   /** Where to look, in local space, or null. */
   look: V | null;
 };
 
 type Leg = { pts: V[]; paw: V; pawAngle: number };
+type RestMode = "down" | "sit" | "groom" | "yawn";
 
-const TAIL_N = 11;
-const TAIL_SEG = 4.9;
+const TAIL_N = 12;
+const TAIL_SEG = 4.6;
+const TURN_TIME = 0.11;
 /** Offscreen bounds around the feet point, in local units. */
-const BOUND_X = 104;
+const BOUND_X = 108;
 const BOUND_UP = 112;
 const BOUND_DOWN = 26;
 
@@ -438,13 +910,12 @@ function fur(ctx: CanvasRenderingContext2D): CanvasPattern | null {
     return seed / 2147483647;
   };
   g.lineCap = "round";
-  for (let i = 0; i < 520; i++) {
+  for (let i = 0; i < 560; i++) {
     const x = rnd() * 96;
     const y = rnd() * 96;
     const a = 1.35 + (rnd() - 0.5) * 0.7;
     const l = 3 + rnd() * 5;
-    const light = rnd() < 0.5;
-    g.strokeStyle = light ? "rgba(255, 246, 228, 0.55)" : "rgba(30, 22, 16, 0.55)";
+    g.strokeStyle = rnd() < 0.5 ? "rgba(255, 246, 228, 0.55)" : "rgba(30, 22, 16, 0.55)";
     g.lineWidth = 0.7 + rnd() * 0.6;
     for (const ox of [-96, 0, 96]) {
       for (const oy of [-96, 0, 96]) {
@@ -461,72 +932,115 @@ function fur(ctx: CanvasRenderingContext2D): CanvasPattern | null {
 
 export class Olive {
   private t = 0;
-  private gait = 0;
+  private phase = 0;
   private speed = 0;
-  private runK = 0;
+  private wWalk = 0;
+  private wTrot = 0;
+  private wGallop = 0;
   private air = 0;
-  private glide = 0;
-  private dive = 0;
-  private skid = 0;
-  private sit = 1;
-  private idle = 0;
-  private tired = 0;
   private vy = 0;
   private vx = 0;
+  private leap = 0;
+  private launch = 0;
+  private skid = 0;
   private crouch = 0;
   private crouchV = 0;
-  private launch = 0;
   private squash = 0;
   private squashV = 0;
+  // Resting: sit down, then groom or yawn now and then.
+  private resting = true;
+  private restW = 1;
+  private restMode: RestMode = "sit";
+  private restK = 1;
+  private nextInterlude = 6;
+  private idle = 0;
+  // Eating at the end.
+  private eatK = -1;
+  private happy = 0;
+  // Turning round.
+  private facing: 1 | -1 = 1;
+  private turnFrom: 1 | -1 = 1;
+  private turnK = 1;
+  // Face.
   private blink = 0;
   private blinkAt = 2.2;
   private slowBlink = 0;
   private earTwitch = [0, 0];
   private earAt = 3;
-  private lookX = 0.25;
+  private earLag = 0;
+  private earLagV = 0;
+  private lookX = 0.3;
   private lookY = 0;
   private pupil = 0.45;
+  // Collar.
+  private bell = 0;
+  private bellV = 0;
   private bowFlap = 0;
+  // Tail chain.
   private tailA: number[] = [];
   private tailW: number[] = [];
   private lastBase = Math.PI;
-  private pose: Pose = sitPose();
-  private happy = 0;
+  // Paws pinned to the floor while planted.
+  private locks = [0, 1, 2, 3].map(() => ({ on: false, wx: 0 }));
+  // The head steadies itself while the body bounds underneath.
+  private headY = 0;
+  private headFix = 0;
+  private pose: Pose = sitPose(0);
   private color: HTMLCanvasElement | null = null;
   private sil: HTMLCanvasElement | null = null;
   private rimC: HTMLCanvasElement | null = null;
+  private placed: { ox: number; oy: number } | null = null;
+  private lastScale = 1;
 
   constructor() {
-    const base = Math.PI - 1.15;
-    this.lastBase = base;
+    const b = Math.PI - 0.85;
+    this.lastBase = b;
     for (let i = 0; i < TAIL_N; i++) {
       const q = i / (TAIL_N - 1);
-      this.tailA.push(base - 2.3 * q * q);
+      this.tailA.push(b - 1.9 * smoothstep(0.1, 1, q));
       this.tailW.push(0);
     }
   }
 
-  /** Physics events: kick the springs. */
+  /** Physics events: kick the springs and clips. */
   jumped() {
     this.launch = 1;
-    this.squashV -= 3.2;
-    this.sit = 0;
-    this.idle = 0;
+    this.squashV -= 3;
+    this.wake();
   }
 
   landed(impact: number) {
-    const k = clamp(impact / 12, 0.15, 1);
-    this.crouchV += 7 * k;
+    const k = clamp(impact / 13, 0.12, 1);
+    this.crouchV += 7.5 * k;
     this.squashV += 5.5 * k;
     this.launch = 0;
+    this.earLagV += 6 * k;
+    this.bellV += 8 * k;
   }
 
-  celebrate() {
-    this.happy = 1;
+  dropped() {
+    this.squashV += 3;
+    this.wake();
   }
 
-  get sitting() {
-    return this.sit;
+  /** How much of the salmon is gone, 0..1. */
+  get eaten() {
+    return this.eatK < 0 ? 0 : smoothstep(0.24, 0.78, this.eatK);
+  }
+
+  get finishedEating() {
+    return this.eatK >= 1;
+  }
+
+  private wake() {
+    this.resting = false;
+    this.idle = 0;
+  }
+
+  reset() {
+    this.eatK = -1;
+    this.happy = 0;
+    this.wake();
   }
 
   update(dt: number, d: OliveDrive) {
@@ -535,46 +1049,75 @@ export class Olive {
     const t = this.t;
     const ease = (rate: number) => 1 - Math.exp(-dt * rate);
 
+    // Turning round: a quick squeeze through the middle.
+    if (d.facing !== this.facing) {
+      this.turnFrom = this.facing;
+      this.facing = d.facing;
+      this.turnK = 0;
+      for (const l of this.locks) l.on = false;
+    }
+    this.turnK = Math.min(1, this.turnK + dt / TURN_TIME);
+
+    const prevVx = this.vx;
     this.vx = d.vx;
     this.vy = lerp(this.vy, d.vy, ease(30));
     const sp = Math.abs(d.vx);
-    if (d.grounded) this.speed = lerp(this.speed, sp, ease(14));
-    this.runK = lerp(this.runK, smoothstep(5.0, 7.6, this.speed), ease(8));
+    if (d.grounded) this.speed = lerp(this.speed, sp, ease(16));
+    const gal = smoothstep(5.6, 7.8, this.speed);
+    const trot = smoothstep(1.6, 4.2, this.speed) * (1 - gal);
+    this.wGallop = gal;
+    this.wTrot = trot;
+    this.wWalk = 1 - gal - trot;
+    const cycle =
+      cycleOf(WALK) * this.wWalk + cycleOf(TROT) * this.wTrot + cycleOf(GALLOP) * this.wGallop;
+    if (d.grounded) this.phase = frac(this.phase + ((this.speed / d.scale) * 60 * dt) / cycle);
 
-    // Gait phase advances with distance so paws don't skate.
-    const stride = strideFor(this.speed, this.runK);
-    const stance = stanceFor(this.runK);
-    if (d.grounded) this.gait = (this.gait + (this.speed * 60 * dt * stance) / stride) % 1;
+    this.air = lerp(this.air, d.grounded ? 0 : 1, ease(d.grounded ? 32 : 18));
+    if (!d.grounded) this.leap = lerp(this.leap, smoothstep(2.5, 7.5, sp), ease(6));
+    else this.leap = smoothstep(2.5, 7.5, sp);
+    this.skid = lerp(this.skid, d.turning && sp > 2.5 ? 1 : 0, ease(18));
+    this.launch = Math.max(0, this.launch - dt * 8);
 
-    this.air = lerp(this.air, d.grounded ? 0 : 1, ease(d.grounded ? 30 : 16));
-    this.glide = lerp(this.glide, d.gliding ? 1 : 0, ease(d.gliding ? 10 : 14));
-    this.dive = lerp(this.dive, d.diving && !d.grounded ? 1 : 0, ease(14));
-    this.skid = lerp(this.skid, d.skidding ? 1 : 0, ease(20));
-    this.tired = lerp(this.tired, d.gliding && d.stamina < 0.25 ? 1 : 0, ease(8));
-    this.launch = Math.max(0, this.launch - dt * 7);
-
-    const still = d.grounded && sp < 0.2 && !d.busy;
+    // Rest: sit after a pause, then groom or yawn now and then.
+    const still = d.grounded && sp < 0.15 && !d.busy && this.eatK < 0;
     this.idle = still ? this.idle + dt : 0;
-    const wantSit = (d.rest || this.idle > 4.5) && d.grounded;
-    this.sit = lerp(this.sit, wantSit ? 1 : 0, ease(wantSit ? 3.2 : 14));
-    this.happy = Math.max(0, this.happy - dt * 0.2);
+    if ((d.rest || this.idle > 4) && d.grounded && !this.resting && this.eatK < 0) {
+      this.resting = true;
+      this.restMode = d.rest ? "sit" : "down";
+      this.restK = d.rest ? 1 : 0;
+      this.nextInterlude = 5 + Math.random() * 4;
+    }
+    if (this.resting && (!still || !d.grounded) && !d.rest) this.resting = false;
+    this.restW = this.resting ? 1 : Math.max(0, this.restW - dt / 0.16);
+    if (this.resting) this.stepRest(dt);
 
-    // Springs for the landing crouch and the squash.
-    this.crouchV += (-220 * this.crouch - 18 * this.crouchV) * dt;
+    // Eating at the salmon.
+    if (d.eat && this.eatK < 0) this.eatK = 0;
+    if (this.eatK >= 0) {
+      this.eatK = Math.min(1, this.eatK + dt / 2.3);
+      if (this.eatK >= 1) this.happy = Math.min(1, this.happy + dt * 2);
+    }
+
+    // Springs: landing crouch, squash and stretch, ears, bell.
+    this.crouchV += (-210 * this.crouch - 17 * this.crouchV) * dt;
     this.crouch += this.crouchV * dt;
     this.squashV += (-260 * this.squash - 16 * this.squashV) * dt;
     this.squash += this.squashV * dt;
+    const accel = (d.vx - prevVx) / Math.max(dt, 1e-3);
+    this.earLagV += (-150 * this.earLag - 10 * this.earLagV - accel * 0.002 * d.facing) * dt;
+    this.earLag += this.earLagV * dt;
+    this.bellV += (-90 * this.bell - 3.5 * this.bellV + accel * 0.012 * d.facing) * dt;
+    this.bell = clamp(this.bell + this.bellV * dt, -1.2, 1.2);
 
     // Blinks: random, sometimes doubled, slow and contented while sitting.
     this.blinkAt -= dt;
     if (this.blinkAt <= 0) {
       this.blink = 1;
-      this.slowBlink = this.sit > 0.7 && Math.random() < 0.45 ? 1 : 0;
+      this.slowBlink = this.resting && Math.random() < 0.45 ? 1 : 0;
       this.blinkAt = 1.8 + Math.random() * 3.4;
       if (Math.random() < 0.18) this.blinkAt = 0.28;
     }
     this.blink = Math.max(0, this.blink - dt * (this.slowBlink ? 2.2 : 7.5));
-
     this.earAt -= dt;
     if (this.earAt <= 0) {
       this.earTwitch[Math.random() < 0.5 ? 0 : 1] = 1;
@@ -582,9 +1125,9 @@ export class Olive {
     }
     this.earTwitch = this.earTwitch.map((e) => Math.max(0, e - dt * 6));
 
-    // Eyes follow the look target, or the landing below while airborne.
+    // Eyes: a look target, or the landing below while airborne.
     let lx = 0.3;
-    let ly = 0;
+    let ly = 0.05;
     if (d.look) {
       const m = Math.hypot(d.look.x, d.look.y) || 1;
       lx = d.look.x / m;
@@ -596,69 +1139,135 @@ export class Olive {
     }
     this.lookX = lerp(this.lookX, lx, ease(8));
     this.lookY = lerp(this.lookY, ly, ease(8));
-    const excited = Math.max(this.glide, this.dive, this.happy, this.runK * 0.6);
-    this.pupil = lerp(this.pupil, 0.35 + excited * 0.55, ease(4));
-    this.bowFlap += dt * (6 + this.glide * 26 + this.runK * 10);
+    const excited = Math.max(this.wGallop * 0.7, this.air * 0.6, this.eatK >= 0 ? 1 : 0);
+    this.pupil = lerp(this.pupil, 0.35 + excited * 0.5, ease(4));
+    this.bowFlap += dt * (6 + this.wGallop * 12 + this.air * 10);
 
-    this.pose = this.blend(t);
+    this.pose = this.compose(t);
+    this.pinPaws(d);
+    this.ground(d);
+    this.steadyHead(dt);
     this.updateTail(dt, t);
   }
 
-  private blend(t: number): Pose {
-    let ground = gaitPose(this.gait, this.speed, this.runK);
-    // Breathing and a slow idle sway.
-    ground.by += Math.sin(t * 2.3) * 0.35;
-    ground.tailRaise += Math.sin(t * 1.3) * 0.08;
-    if (this.skid > 0.01) ground = lerpPose(ground, skidPose(), this.skid);
-    const sit = sitPose();
-    sit.tailCurl += Math.sin(t * 1.7) * 0.12 + Math.sin(t * 7) * 0.25 * this.happy;
-    sit.by += Math.sin(t * 2.1) * 0.3;
-    ground = lerpPose(ground, sit, smooth(this.sit));
-
-    let air = airPose(this.vy, this.vx);
-    if (this.launch > 0) {
-      // Push-off: hind legs still driving into the cushion for a few frames.
-      const L = smooth(this.launch);
-      air = lerpPose(air, { ...air, meta: [-0.5, -0.6], pitch: air.pitch - 0.12 }, L);
-      air.feet[FAR_HIND] = lerpV(air.feet[FAR_HIND], vec(HOME_HIND - 9, -PAW_R + 6 * (1 - L)), L);
-      air.feet[NEAR_HIND] = lerpV(
-        air.feet[NEAR_HIND],
-        vec(HOME_HIND - 13, -PAW_R + 6 * (1 - L)),
-        L,
-      );
-    }
-    if (this.glide > 0.01) air = lerpPose(air, glidePose(t, this.tired), smooth(this.glide));
-    if (this.dive > 0.01) air = lerpPose(air, divePose(), smooth(this.dive));
-
-    const pose = lerpPose(ground, air, smooth(this.air));
-    // Landing crouch drops the body; the legs absorb it through IK.
-    const c = clamp(this.crouch, -0.3, 1.2);
-    pose.by += c * 8 * (1 - this.air);
-    pose.neck += c * 0.12;
-    pose.headTilt += c * 0.1;
-    pose.neck += Math.sin(t * 3) * 0.04 * this.happy;
-
-    // Keep planted paws on the ground: if a leg can't reach, lower the body.
-    if (this.air < 0.5) {
-      const f = frameOf(pose.bx, pose.by, pose.pitch, pose.stretch);
-      let need = 0;
-      for (let i = 0; i < 4; i++) {
-        const foot = pose.feet[i]!;
-        if (foot.y < -PAW_R - 0.5) continue;
-        const front = i >= 2;
-        let gap: number;
-        if (front) {
-          gap = len(sub(foot, f.shoulderJoint)) - (FRONT_UPPER + FRONT_LOWER) * 0.97;
-        } else {
-          const m = pose.meta[i === FAR_HIND ? 0 : 1];
-          const hock = sub(foot, mul(vec(Math.sin(m), Math.cos(m)), META));
-          gap = len(sub(hock, f.hipJoint)) - (THIGH + SHIN) * 0.97;
-        }
-        need = Math.max(need, gap);
+  private stepRest(dt: number) {
+    const dur = { down: 0.75, sit: 1, groom: 3.6, yawn: 2 }[this.restMode];
+    this.restK = Math.min(1, this.restK + dt / dur);
+    if (this.restMode === "down" && this.restK >= 1) {
+      this.restMode = "sit";
+      this.restK = 0;
+    } else if ((this.restMode === "groom" || this.restMode === "yawn") && this.restK >= 1) {
+      this.restMode = "sit";
+      this.restK = 0;
+      this.nextInterlude = 6 + Math.random() * 6;
+    } else if (this.restMode === "sit") {
+      this.nextInterlude -= dt;
+      if (this.nextInterlude <= 0) {
+        this.restMode = Math.random() < 0.6 ? "groom" : "yawn";
+        this.restK = 0;
       }
-      pose.by += need * (1 - this.air);
     }
-    return pose;
+  }
+
+  private compose(t: number): Pose {
+    // On the ground: idle and the three gaits, all on one phase.
+    const moving = smoothstep(0.05, 0.9, this.speed);
+    let ground = blend([
+      [idlePose(t), 1 - moving],
+      [gaitPose(WALK, this.phase), moving * this.wWalk],
+      [gaitPose(TROT, this.phase), moving * this.wTrot],
+      [gaitPose(GALLOP, this.phase), moving * this.wGallop],
+    ]);
+    if (this.skid > 0.01) ground = mix(ground, skidPose(), this.skid);
+
+    if (this.restW > 0) {
+      let rest: Pose;
+      if (this.restMode === "down") rest = sitDownPose(this.restK, t);
+      else if (this.restMode === "groom") rest = groomPose(this.restK, t);
+      else if (this.restMode === "yawn") rest = yawnPose(this.restK, t);
+      else rest = sitPose(t);
+      ground = mix(ground, rest, smooth(this.restW));
+    }
+    if (this.eatK >= 0) {
+      const eat = eatPose(this.eatK, t, idlePose(t));
+      if (this.happy > 0) {
+        eat.eyes = lerp(eat.eyes, 0.18, this.happy);
+        eat.tailCurl += Math.sin(t * 6) * 0.25 * this.happy;
+        eat.by += Math.sin(t * 9) * 0.25 * this.happy;
+      }
+      ground = eat;
+    }
+
+    const air = airPose(this.vy, this.leap, this.launch);
+    const p = mix(ground, air, smooth(this.air));
+    // Landing crouch drops the body; the legs absorb it through IK.
+    const c = clamp(this.crouch, -0.3, 1.2) * (1 - this.air);
+    p.by += c * 8;
+    p.arch += c * 2.5;
+    p.neck += c * 0.14;
+    p.head += c * 0.12;
+    p.tailRaise -= c * 0.4;
+    return p;
+  }
+
+  /** Planted paws keep their spot on the floor while the body moves over them. */
+  private pinPaws(d: OliveDrive) {
+    const p = this.pose;
+    const grounded = this.air < 0.3 && this.turnK >= 1;
+    for (let i = 0; i < 4; i++) {
+      const lock = this.locks[i]!;
+      const w = p.lock[i]! * (grounded ? 1 : 0);
+      const foot = p.feet[i]!;
+      if (w > 0.1 && foot.y > -PAW_R - 1) {
+        const authored = d.worldX + this.facing * foot.x * d.scale;
+        if (!lock.on && w > 0.55) {
+          lock.on = true;
+          lock.wx = authored;
+        }
+        if (lock.on) {
+          // Too far from where the clip wants it: let the paw slide over, never pop.
+          let local = ((lock.wx - d.worldX) * this.facing) / d.scale;
+          if (Math.abs(local - foot.x) > 18) {
+            lock.wx = lerp(lock.wx, authored, 0.35);
+            local = ((lock.wx - d.worldX) * this.facing) / d.scale;
+          }
+          p.feet[i] = vec(lerp(foot.x, local, w), foot.y);
+        }
+      } else {
+        lock.on = false;
+      }
+    }
+  }
+
+  /** If a planted leg can't reach the floor, lower the body until it can. */
+  private ground(_d: OliveDrive) {
+    const p = this.pose;
+    if (this.air > 0.5) return;
+    const f = frameOf(p.bx, p.by, p.pitch, p.stretch);
+    let need = 0;
+    for (let i = 0; i < 4; i++) {
+      const foot = p.feet[i]!;
+      if (foot.y < -PAW_R - 0.5 || p.lock[i]! < 0.5) continue;
+      let gap: number;
+      if (i >= 2) {
+        gap = len(sub(foot, f.shoulderJoint)) - (F_UPPER + F_LOWER) * 0.98;
+      } else {
+        const m = p.meta[i]!;
+        const hock = sub(foot, mul(vec(Math.sin(m), Math.cos(m)), H_META));
+        gap = len(sub(hock, f.hipJoint)) - (H_THIGH + H_SHIN) * 0.98;
+      }
+      need = Math.max(need, gap);
+    }
+    p.by += Math.min(need, 8) * (1 - this.air);
+  }
+
+  private steadyHead(dt: number) {
+    const p = this.pose;
+    const f = frameOf(p.bx, p.by, p.pitch, p.stretch);
+    const raw = this.headPlacement(p, f, 0).pos.y;
+    this.headY = lerp(this.headY || raw, raw, 1 - Math.exp(-dt * 9));
+    const amount = (this.wGallop * 0.7 + this.wTrot * 0.45) * (1 - this.air) * (1 - this.restW);
+    this.headFix = clamp(this.headY - raw, -5, 5) * amount;
   }
 
   private updateTail(dt: number, t: number) {
@@ -666,25 +1275,22 @@ export class Olive {
     const f = frameOf(p.bx, p.by, p.pitch, p.stretch);
     // Unwrap so the tail never swings the long way round.
     const raw = Math.atan2(-f.fwd.y, -f.fwd.x) + p.tailRaise;
-    const base = this.lastBase + wrap(raw - this.lastBase);
-    const turn = base - this.lastBase;
-    this.lastBase = base;
+    const b = this.lastBase + wrap(raw - this.lastBase);
+    const turn = b - this.lastBase;
+    this.lastBase = b;
     const wave = p.tailWave;
     for (let i = 0; i < TAIL_N; i++) {
       const q = i / (TAIL_N - 1);
       const target =
-        base +
-        p.tailCurl * smoothstep(0.1, 1, q) * 1.1 +
-        Math.sin(t * (2.2 + wave * 8) - i * 0.6) * wave * 0.3 * q;
+        b +
+        p.tailCurl * smoothstep(0.08, 1, q) * 1.1 +
+        Math.sin(t * (2.2 + wave * 7) - i * 0.6) * wave * 0.3 * q;
       let a = this.tailA[i]!;
       a = target + wrap(a - target);
       a += turn * (1 - q) * 0.6;
-      const stiff = lerp(140, 45, q);
-      const damp = lerp(18, 8, q);
       let w = this.tailW[i]!;
-      w += ((target - a) * stiff - w * damp) * dt;
-      // Vertical motion flicks the tail against it.
-      w += -this.vy * 0.015 * q * (this.air > 0.5 ? 1 : 0);
+      w += ((target - a) * lerp(150, 45, q) - w * lerp(18, 8, q)) * dt;
+      w += -this.vy * 0.016 * q * (this.air > 0.5 ? 1 : 0);
       this.tailW[i] = w;
       this.tailA[i] = a + w * dt;
     }
@@ -694,14 +1300,11 @@ export class Olive {
   /* Compositing                                                             */
   /* ---------------------------------------------------------------------- */
 
-  /** Where the last prepared frame sits on the canvas, in device pixels. */
-  private placed: { ox: number; oy: number } | null = null;
-
   /**
-   * Paint this frame offscreen, at the feet point in the context's current
-   * world transform. `facing` mirrors the rig.
+   * Paint this frame offscreen at the feet point in the context's current
+   * world transform.
    */
-  prepare(ctx: CanvasRenderingContext2D, x: number, y: number, facing: 1 | -1, scale = 1) {
+  prepare(ctx: CanvasRenderingContext2D, x: number, y: number, scale = 1) {
     const m = ctx.getTransform();
     const s = Math.hypot(m.a, m.b) * scale;
     this.placed = null;
@@ -729,15 +1332,20 @@ export class Olive {
     const rc = this.rimC.getContext("2d");
     if (!cc || !sc || !rc) return;
 
-    // 1. Paint the parts.
+    // The turn squeezes her through the middle and flips her.
+    const k = smooth(this.turnK);
+    const fx = lerp(this.turnFrom, this.facing, k);
+    const sx = (Math.sign(fx) || this.facing) * lerp(0.5, 1, Math.abs(fx));
+    const turnSquash = 1 + 0.06 * (1 - Math.abs(fx));
+    const sq = clamp(this.squash * 0.06, -0.14, 0.16);
+
     cc.setTransform(1, 0, 0, 1, 0, 0);
     cc.clearRect(0, 0, W, H);
-    const sq = clamp(this.squash * 0.06, -0.14, 0.16);
     cc.setTransform(
-      facing * s * (1 + sq * 0.6),
+      sx * s * (1 + sq * 0.6),
       0,
       0,
-      s * (1 - sq),
+      s * (1 - sq) * turnSquash,
       ax + (px - ix),
       ay + (py - iy),
     );
@@ -745,8 +1353,8 @@ export class Olive {
     cc.lineCap = "round";
     this.paint(cc);
 
-    // 2. Silhouette outline: dilate the cat and tint it.
-    const r = clamp(1.2 * s, 1.3, 4.2);
+    // Silhouette outline: dilate the cat and tint it.
+    const r = clamp(1.05 * s, 1.2, 3.6);
     sc.setTransform(1, 0, 0, 1, 0, 0);
     sc.globalCompositeOperation = "source-over";
     sc.clearRect(0, 0, W, H);
@@ -759,8 +1367,8 @@ export class Olive {
     sc.fillRect(0, 0, W, H);
     sc.globalCompositeOperation = "source-over";
 
-    // 3. Rim light: the top edge of the cat, as if lit from the windows.
-    const d = clamp(1.7 * s, 1.5, 5.5);
+    // Rim light: the top edge, as if lit from the high windows.
+    const dd = clamp(1.6 * s, 1.5, 5);
     rc.setTransform(1, 0, 0, 1, 0, 0);
     rc.globalCompositeOperation = "source-over";
     rc.clearRect(0, 0, W, H);
@@ -769,14 +1377,12 @@ export class Olive {
     rc.fillStyle = C.rim;
     rc.fillRect(0, 0, W, H);
     rc.globalCompositeOperation = "destination-out";
-    rc.drawImage(this.color, -d * 0.35, d);
+    rc.drawImage(this.color, -dd * 0.35, dd);
     rc.globalCompositeOperation = "source-over";
 
     this.placed = { ox: ix - ax, oy: iy - ay };
     this.lastScale = s;
   }
-
-  private lastScale = 1;
 
   /** Draw the prepared frame: soft halo, outline, colour, rim light. */
   composite(ctx: CanvasRenderingContext2D, alpha = 1) {
@@ -786,7 +1392,7 @@ export class Olive {
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = alpha;
-    ctx.shadowColor = "rgba(12, 8, 20, 0.45)";
+    ctx.shadowColor = "rgba(12, 8, 20, 0.42)";
     ctx.shadowBlur = clamp(5 * s, 4, 18);
     ctx.shadowOffsetY = clamp(1.5 * s, 1, 4);
     ctx.drawImage(this.sil, ox, oy);
@@ -794,7 +1400,7 @@ export class Olive {
     ctx.shadowBlur = 0;
     ctx.shadowOffsetY = 0;
     ctx.drawImage(this.color, ox, oy);
-    ctx.globalAlpha = alpha * 0.55;
+    ctx.globalAlpha = alpha * 0.5;
     ctx.drawImage(this.rimC, ox, oy);
     ctx.restore();
   }
@@ -817,58 +1423,66 @@ export class Olive {
     ctx.restore();
   }
 
-  draw(ctx: CanvasRenderingContext2D, x: number, y: number, facing: 1 | -1, scale = 1, alpha = 1) {
-    this.prepare(ctx, x, y, facing, scale);
+  draw(ctx: CanvasRenderingContext2D, x: number, y: number, scale = 1, alpha = 1) {
+    this.prepare(ctx, x, y, scale);
     this.composite(ctx, alpha);
   }
 
   private paint(ctx: CanvasRenderingContext2D) {
     const p = this.pose;
     const f = frameOf(p.bx, p.by, p.pitch, p.stretch);
-    const legs = this.solveLegs(p, f);
+    const head = this.headPlacement(p, f, this.headFix);
+    const legs = this.solveLegs(p, f, head);
     const tail = this.tailPoints(f);
-    const sitting = this.sit > 0.55;
-    const head = this.headPlacement(p, f);
+    const sitting = this.restW * (this.resting ? 1 : 0) > 0.5 && this.restMode !== "down";
+    const sittingLow = sitting || (this.resting && this.restK > 0.6);
     const body = this.bodyPath(f, p.arch);
 
-    this.drawLeg(ctx, legs[FAR_HIND]!, true, false);
-    this.drawLeg(ctx, legs[FAR_FRONT]!, true, true);
-    if (!sitting) this.drawTail(ctx, tail);
+    this.drawLeg(ctx, legs[FH]!, true, false);
+    this.drawLeg(ctx, legs[FF]!, true, true);
+    if (!sittingLow) this.drawTail(ctx, tail);
     this.drawNeck(ctx, f, head);
     this.drawBody(ctx, body);
-    this.drawLeg(ctx, legs[NEAR_HIND]!, false, false, body.path);
-    if (sitting) this.drawTail(ctx, tail);
-    this.drawLeg(ctx, legs[NEAR_FRONT]!, false, true, body.path);
+    this.drawLeg(ctx, legs[NH]!, false, false, body.path);
+    if (sittingLow) this.drawTail(ctx, tail);
+    const pawUp = p.face > 0.4;
+    if (!pawUp) this.drawLeg(ctx, legs[NF]!, false, true, body.path);
     this.drawJawShadow(ctx, head);
     this.drawHead(ctx, head.pos, head.angle);
     this.drawBow(ctx, head);
+    if (pawUp) this.drawLeg(ctx, legs[NF]!, false, true, body.path);
   }
 
-  /** Where the head sits; also used by the bow. */
-  private headPlacement(p: Pose, f: Frame) {
-    const neckRoot = add(f.shoulder, add(mul(f.fwd, 4), mul(f.up, 1)));
+  /** Where the head sits. */
+  private headPlacement(p: Pose, f: Frame, fix: number) {
+    const neckRoot = add(f.shoulder, add(mul(f.fwd, 4), mul(f.up, 4)));
     const angle = p.pitch * 0.45 + p.neck;
-    const pos = add(neckRoot, rot(vec(13, -10.5), angle));
-    return { pos, angle: p.headTilt + p.pitch * 0.25, neckRoot };
+    const pos = add(add(neckRoot, rot(vec(12, -12), angle)), vec(0, fix));
+    return { pos, angle: p.head + p.pitch * 0.25 };
   }
 
-  private solveLegs(p: Pose, f: Frame): Leg[] {
+  private solveLegs(p: Pose, f: Frame, head: { pos: V; angle: number }): Leg[] {
     const out: Leg[] = [];
     for (let i = 0; i < 4; i++) {
       const front = i >= 2;
-      const far = i === FAR_HIND || i === FAR_FRONT;
+      const far = i === FH || i === FF;
       const shift = far ? add(mul(f.fwd, 2.5), mul(f.up, 1.5)) : vec(0, 0);
-      const target = p.feet[i]!;
+      let target = p.feet[i]!;
+      if (i === NF && p.face > 0) {
+        const spot = add(head.pos, rot(vec(p.faceX, p.faceY), head.angle));
+        target = lerpV(target, spot, p.face);
+      }
       if (front) {
         const root = add(f.shoulderJoint, shift);
-        const s = ik(root, target, FRONT_UPPER, FRONT_LOWER, 1);
-        out.push({ pts: [root, s.mid, s.end], paw: s.end, pawAngle: p.paw[i]! });
+        const s = ik(root, target, F_UPPER, F_LOWER, 1);
+        const pawAngle = p.paw[i]! + (i === NF ? p.face * -1.2 : 0);
+        out.push({ pts: [root, s.mid, s.end], paw: s.end, pawAngle });
       } else {
         const root = add(f.hipJoint, shift);
-        const m = p.meta[i === FAR_HIND ? 0 : 1];
+        const m = p.meta[i]!;
         const dir = vec(Math.sin(m), Math.cos(m));
-        const s = ik(root, sub(target, mul(dir, META)), THIGH, SHIN, -1);
-        const paw = add(s.end, mul(dir, META));
+        const s = ik(root, sub(target, mul(dir, H_META)), H_THIGH, H_SHIN, -1);
+        const paw = add(s.end, mul(dir, H_META));
         out.push({ pts: [root, s.mid, s.end, paw], paw, pawAngle: p.paw[i]! });
       }
     }
@@ -887,12 +1501,36 @@ export class Olive {
       const tan = norm(sub(b, a));
       return { p: lerpV(a, b, u), n: vec(tan.y, -tan.x), t: tan };
     };
+    // Back: rump, loin, a dip, then the shoulder blades.
     const top = (u: number) =>
-      9.5 + 1.8 * Math.exp(-((u - 0.1) ** 2) / 0.012) - 1.2 * Math.exp(-((u - 0.55) ** 2) / 0.04);
+      keyed(
+        u,
+        [
+          [0, 9.5],
+          [0.08, 10.8],
+          [0.3, 9.2],
+          [0.55, 8.2],
+          [0.85, 9.8],
+          [1, 9.2],
+        ],
+        false,
+      );
+    // Underline: thigh, a tucked flank, the belly, and a deep chest.
     const bot = (u: number) =>
-      lerp(12.5, 20, smoothstep(0.2, 0.9, u)) - 2.4 * Math.exp(-((u - 0.3) ** 2) / 0.02);
+      keyed(
+        u,
+        [
+          [0, 12],
+          [0.22, 9.2],
+          [0.45, 11.4],
+          [0.7, 15.8],
+          [0.88, 18.4],
+          [1, 15.5],
+        ],
+        false,
+      );
     const pts: V[] = [];
-    const N = 10;
+    const N = 12;
     for (let i = 0; i <= N; i++) {
       const u = i / N;
       const s = spine(u);
@@ -900,16 +1538,16 @@ export class Olive {
     }
     // Chest: round forward and down into a fluffy bib.
     const s1 = spine(1);
-    for (let i = 1; i < 8; i++) {
-      const a = (i / 8) * Math.PI;
-      const fluff = i > 2 && i < 7 ? (i % 2 ? 1.4 : -0.4) : 0;
-      const r = lerp(top(1), bot(1), (1 - Math.cos(a)) / 2) + 7 * Math.sin(a) + fluff;
-      pts.push(add(s1.p, add(mul(s1.n, Math.cos(a) * r), mul(s1.t, Math.sin(a) * r * 0.8))));
+    for (let i = 1; i < 9; i++) {
+      const a = (i / 9) * Math.PI;
+      const fluff = i > 3 && i < 8 ? (i % 2 ? 1.4 : -0.3) : 0;
+      const r = lerp(top(1), bot(1), (1 - Math.cos(a)) / 2) + 7.5 * Math.sin(a) + fluff;
+      pts.push(add(s1.p, add(mul(s1.n, Math.cos(a) * r), mul(s1.t, Math.sin(a) * r * 0.78))));
     }
     for (let i = N; i >= 0; i--) {
       const u = i / N;
       const s = spine(u);
-      const fluff = i > 2 && i < 8 ? (i % 2 ? 0.7 : -0.3) : 0;
+      const fluff = i > 3 && i < 10 ? (i % 2 ? 0.8 : -0.3) : 0;
       pts.push(add(s.p, mul(s.n, -bot(u) - fluff)));
     }
     // Rump.
@@ -919,7 +1557,7 @@ export class Olive {
       const r = lerp(bot(0), top(0), (1 - Math.cos(a)) / 2) + 4 * Math.sin(a);
       pts.push(add(s0.p, add(mul(s0.n, -Math.cos(a) * r), mul(s0.t, -Math.sin(a) * r * 0.9))));
     }
-    return { path: smoothClosed(pts), spine, top, bot };
+    return { path: smoothClosed(pts), spine };
   }
 
   private drawBody(ctx: CanvasRenderingContext2D, body: ReturnType<Olive["bodyPath"]>) {
@@ -938,39 +1576,38 @@ export class Olive {
     g.addColorStop(1, C.tabbyDark);
     ctx.fillStyle = g;
     ctx.fill(path);
-    this.furTexture(ctx, path, 0.28);
+    this.furTexture(ctx, path, 0.26);
 
-    // Dark saddle along the spine, darker over the shoulders as in the photos.
+    // Dark saddle along the spine, darkest over the shoulders.
     ctx.strokeStyle = C.stripe;
     ctx.globalAlpha = 0.5;
     ctx.lineWidth = 6;
     ctx.beginPath();
     for (let i = 0; i <= 12; i++) {
       const s = spine(i / 12);
-      const q = add(s.p, mul(s.n, 8.2));
+      const q = add(s.p, mul(s.n, 8.4));
       if (i === 0) ctx.moveTo(q.x, q.y);
       else ctx.lineTo(q.x, q.y);
     }
     ctx.stroke();
-    ctx.globalAlpha = 0.35;
-    const sh = spine(0.88);
+    ctx.globalAlpha = 0.3;
+    const sh = spine(0.86);
     ctx.fillStyle = C.stripe;
     ctx.beginPath();
     ctx.ellipse(sh.p.x, sh.p.y + 1, 9, 11, Math.atan2(sh.t.y, sh.t.x), 0, TAU);
     ctx.fill();
 
     // Mackerel stripes: thin, wavy, tapering down the flank.
-    ctx.globalAlpha = 0.7;
-    ctx.fillStyle = C.stripe;
-    const stripes = [0.04, 0.14, 0.25, 0.36, 0.47, 0.58, 0.69, 0.8];
+    ctx.globalAlpha = 0.66;
+    const stripes = [0.03, 0.12, 0.21, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
     stripes.forEach((u, i) => {
       const s = spine(u);
-      const depth = 8 + (i % 3) * 2.5;
-      const wob = (i % 2 ? 1 : -1) * 1.6;
-      const w = 1.25 + (i % 2) * 0.35;
-      const a = add(s.p, mul(s.n, 9.5));
+      const depth = 7 + (i % 3) * 2.6;
+      const wob = (i % 2 ? 1 : -1) * 1.5;
+      const w = 1.1 + (i % 2) * 0.3;
+      const a = add(s.p, mul(s.n, 9.6));
       const m = add(s.p, mul(s.t, wob));
-      const b = add(add(s.p, mul(s.n, -depth)), mul(s.t, -wob * 0.6 - 1.5));
+      const b = add(add(s.p, mul(s.n, -depth)), mul(s.t, -wob * 0.6 - 1.4));
       ctx.beginPath();
       ctx.moveTo(a.x - s.t.x * w, a.y - s.t.y * w);
       ctx.quadraticCurveTo(m.x - s.t.x * w * 1.2, m.y - s.t.y * w * 1.2, b.x, b.y);
@@ -982,24 +1619,23 @@ export class Olive {
       );
       ctx.closePath();
       ctx.fill();
-      // A broken fleck below some stripes.
       if (i % 2 === 0) {
-        const c = add(add(s.p, mul(s.n, -depth - 3.5)), mul(s.t, -2));
+        const c = add(add(s.p, mul(s.n, -depth - 3.2)), mul(s.t, -2));
         ctx.beginPath();
-        ctx.ellipse(c.x, c.y, 0.9, 1.8, Math.atan2(s.n.y, s.n.x), 0, TAU);
+        ctx.ellipse(c.x, c.y, 0.8, 1.7, Math.atan2(s.n.y, s.n.x), 0, TAU);
         ctx.fill();
       }
     });
     ctx.globalAlpha = 1;
 
-    // White: chest, belly, and the splash on the flank.
+    // White chest, belly, and the splash on the flank.
     ctx.fillStyle = C.white;
     ctx.beginPath();
     const edge: V[] = [];
     for (let i = 0; i <= 12; i++) {
       const u = i / 12;
       const s = spine(u);
-      const off = lerp(-12, -1.5, smoothstep(0.4, 1, u)) + Math.sin(u * 23) * 0.7;
+      const off = lerp(-11.5, -0.5, smoothstep(0.42, 1, u)) + Math.sin(u * 23) * 0.6;
       edge.push(add(s.p, mul(s.n, off)));
     }
     const s1 = spine(1);
@@ -1012,8 +1648,8 @@ export class Olive {
     for (const q of edge) ctx.lineTo(q.x, q.y);
     ctx.closePath();
     ctx.fill();
-    const sp = spine(0.4);
-    const splash = add(sp.p, mul(sp.n, -8.5));
+    const sp = spine(0.38);
+    const splash = add(sp.p, mul(sp.n, -8));
     ctx.beginPath();
     ctx.ellipse(splash.x, splash.y, 5, 3, Math.atan2(sp.t.y, sp.t.x) - 0.6, 0, TAU);
     ctx.fill();
@@ -1027,8 +1663,8 @@ export class Olive {
     );
     shade.addColorStop(0, "rgba(255, 236, 200, 0.22)");
     shade.addColorStop(0.35, "rgba(255, 236, 200, 0)");
-    shade.addColorStop(0.68, "rgba(60, 50, 90, 0)");
-    shade.addColorStop(1, "rgba(60, 50, 90, 0.32)");
+    shade.addColorStop(0.66, "rgba(60, 50, 90, 0)");
+    shade.addColorStop(1, "rgba(60, 50, 90, 0.34)");
     ctx.fillStyle = shade;
     ctx.fill(path);
     ctx.restore();
@@ -1045,7 +1681,7 @@ export class Olive {
     ctx.restore();
   }
 
-  /** Smooth tapered outline around a chain of joints. */
+  /** A smooth outline around a chain of points with half-widths. */
   private limbPath(pts: V[], hw: number[]): Path2D {
     const L: V[] = [];
     const R: V[] = [];
@@ -1069,84 +1705,127 @@ export class Olive {
     front: boolean,
     body?: Path2D,
   ) {
-    const pts = leg.pts;
-    const hw = front ? [6, 4, 3.1] : [10, 6, 3.3, 3];
+    const j = leg.pts;
+    // Densify the chain so muscles can swell between joints.
+    let pts: V[];
+    let hw: number[];
+    if (front) {
+      pts = [
+        j[0]!,
+        lerpV(j[0]!, j[1]!, 0.5),
+        j[1]!,
+        lerpV(j[1]!, j[2]!, 0.35),
+        lerpV(j[1]!, j[2]!, 0.75),
+        j[2]!,
+      ];
+      hw = [7, 6.3, 4.6, 3.8, 3.2, 3.1];
+    } else {
+      pts = [
+        j[0]!,
+        lerpV(j[0]!, j[1]!, 0.45),
+        j[1]!,
+        lerpV(j[1]!, j[2]!, 0.5),
+        j[2]!,
+        lerpV(j[2]!, j[3]!, 0.5),
+        j[3]!,
+      ];
+      // The heel juts out at the hock.
+      hw = [10.5, 9.4, 5.4, 3.6, 3.9, 2.9, 2.8];
+    }
     const path = this.limbPath(pts, hw);
-    const pawC = add(leg.paw, rot(vec(1.6, 0.1), leg.pawAngle));
+    const pawC = add(leg.paw, rot(vec(1.7, 0.1), leg.pawAngle));
     const paw = new Path2D();
-    paw.ellipse(pawC.x, pawC.y, PAW_R + 1.6, PAW_R, leg.pawAngle, 0, TAU);
+    paw.ellipse(pawC.x, pawC.y, PAW_R + 1.8, PAW_R, leg.pawAngle, 0, TAU);
 
     ctx.save();
-    ctx.fillStyle = front ? C.white : C.tabby;
-    ctx.fill(path);
     ctx.clip(path);
-    if (!front) {
+    if (front) {
+      ctx.fillStyle = C.white;
+      ctx.fill(path);
+      // A soft shadow where the upper arm tucks against the chest.
+      const g = ctx.createLinearGradient(j[0]!.x, j[0]!.y, j[1]!.x, j[1]!.y);
+      g.addColorStop(0, "rgba(70, 62, 104, 0.3)");
+      g.addColorStop(1, "rgba(70, 62, 104, 0)");
+      ctx.fillStyle = g;
+      ctx.fill(path);
+    } else {
       // Haunch light and stripes curving round the thigh.
-      const hc = lerpV(pts[0]!, pts[1]!, 0.45);
+      const hc = lerpV(j[0]!, j[1]!, 0.45);
       const g = ctx.createLinearGradient(hc.x, hc.y - 12, hc.x + 4, hc.y + 12);
       g.addColorStop(0, C.tabbyLight);
       g.addColorStop(0.5, C.tabby);
       g.addColorStop(1, C.tabbyDark);
       ctx.fillStyle = g;
       ctx.fill(path);
-      this.furTexture(ctx, path, 0.25);
+      this.furTexture(ctx, path, 0.22);
       ctx.strokeStyle = C.stripe;
-      ctx.globalAlpha = 0.6;
-      ctx.lineWidth = 1.8;
-      const along = norm(sub(pts[1]!, pts[0]!));
+      ctx.globalAlpha = 0.45;
+      ctx.lineWidth = 1.5;
+      const along = norm(sub(j[1]!, j[0]!));
       const across = vec(-along.y, along.x);
-      for (let k = 0; k < 4; k++) {
-        const c = add(lerpV(pts[0]!, pts[1]!, 0.15 + k * 0.22), mul(across, 2));
+      for (let k = 0; k < 3; k++) {
+        const c = add(lerpV(j[0]!, j[1]!, 0.2 + k * 0.27), mul(across, 2));
         ctx.beginPath();
-        ctx.moveTo(c.x - across.x * 9, c.y - across.y * 9);
+        ctx.moveTo(c.x - across.x * 10, c.y - across.y * 10);
         ctx.quadraticCurveTo(
-          c.x + along.x * 3,
-          c.y + along.y * 3,
-          c.x + across.x * 9,
-          c.y + across.y * 9,
+          c.x + along.x * 3.5,
+          c.y + along.y * 3.5,
+          c.x + across.x * 10,
+          c.y + across.y * 10,
         );
         ctx.stroke();
       }
       for (const q of [0.35, 0.7]) {
-        const c = lerpV(pts[1]!, pts[2]!, q);
-        const dir = norm(sub(pts[2]!, pts[1]!));
-        const n = vec(-dir.y, dir.x);
-        line(ctx, add(c, mul(n, 4)), add(c, mul(n, -4)));
+        const c = lerpV(j[1]!, j[2]!, q);
+        const dir = norm(sub(j[2]!, j[1]!));
+        const nn = vec(-dir.y, dir.x);
+        line(ctx, add(c, mul(nn, 4)), add(c, mul(nn, -4)));
       }
       ctx.globalAlpha = 1;
       // White sock from just above the hock down.
       ctx.strokeStyle = C.white;
-      ctx.lineWidth = 9;
-      line(ctx, lerpV(pts[1]!, pts[2]!, 0.82), pts[3]!);
-    } else {
-      // Soft shading down the back of the white foreleg.
-      const dir = norm(sub(pts[2]!, pts[0]!));
-      const n = vec(dir.y, -dir.x);
-      const mid = lerpV(pts[0]!, pts[2]!, 0.5);
-      const g = ctx.createLinearGradient(
-        mid.x + n.x * 5,
-        mid.y + n.y * 5,
-        mid.x - n.x * 5,
-        mid.y - n.y * 5,
-      );
-      g.addColorStop(0, "rgba(92, 84, 120, 0.28)");
-      g.addColorStop(0.6, "rgba(92, 84, 120, 0)");
-      ctx.fillStyle = g;
-      ctx.fill(path);
+      ctx.lineWidth = 8.5;
+      line(ctx, lerpV(j[1]!, j[2]!, 0.82), j[3]!);
     }
+    // Round the leg: light on the front edge, shade down the back.
+    const a = j[front ? 1 : 2]!;
+    const b = j[j.length - 1]!;
+    const dir = norm(sub(b, a));
+    const nb = vec(-dir.y, dir.x);
+    const mid = lerpV(a, b, 0.5);
+    const cyl = ctx.createLinearGradient(
+      mid.x + nb.x * 5,
+      mid.y + nb.y * 5,
+      mid.x - nb.x * 5,
+      mid.y - nb.y * 5,
+    );
+    cyl.addColorStop(0, "rgba(70, 62, 104, 0.34)");
+    cyl.addColorStop(0.45, "rgba(70, 62, 104, 0)");
+    cyl.addColorStop(0.8, "rgba(255, 244, 222, 0)");
+    cyl.addColorStop(1, "rgba(255, 244, 222, 0.25)");
+    ctx.fillStyle = cyl;
+    ctx.fill(path);
     ctx.restore();
 
+    // Paw with a hint of toes.
     ctx.fillStyle = C.white;
     ctx.fill(paw);
     ctx.save();
     ctx.clip(paw);
-    ctx.fillStyle = C.whiteShade;
+    ctx.fillStyle = C.shade;
     ctx.beginPath();
-    ctx.ellipse(pawC.x, pawC.y + PAW_R * 0.9, PAW_R + 2, PAW_R * 0.7, leg.pawAngle, 0, TAU);
+    ctx.ellipse(pawC.x, pawC.y + PAW_R * 0.95, PAW_R + 2, PAW_R * 0.7, leg.pawAngle, 0, TAU);
     ctx.fill();
+    ctx.strokeStyle = "rgba(86, 78, 118, 0.4)";
+    ctx.lineWidth = 0.5;
+    for (const dx of [1.2, 3.2]) {
+      const p0 = add(pawC, rot(vec(dx, -PAW_R * 0.9), leg.pawAngle));
+      const p1 = add(pawC, rot(vec(dx + 0.3, -PAW_R * 0.2), leg.pawAngle));
+      line(ctx, p0, p1);
+    }
     ctx.restore();
 
-    // Internal edge: only where the leg is outside the body.
+    // Edge lines only where the leg is outside the body, so white on white still reads.
     ctx.save();
     if (body) {
       const outside = new Path2D();
@@ -1154,7 +1833,7 @@ export class Olive {
       outside.addPath(body);
       ctx.clip(outside, "evenodd");
     }
-    ctx.strokeStyle = C.inner;
+    ctx.strokeStyle = front ? "rgba(74, 64, 96, 0.55)" : C.inner;
     ctx.lineWidth = 0.9;
     ctx.stroke(path);
     ctx.stroke(paw);
@@ -1163,25 +1842,23 @@ export class Olive {
       // A faint crease where the haunch meets the flank.
       ctx.save();
       ctx.clip(path);
-      ctx.strokeStyle = "rgba(39, 30, 25, 0.28)";
+      ctx.strokeStyle = "rgba(42, 32, 26, 0.24)";
       ctx.lineWidth = 1;
       ctx.stroke(path);
       ctx.restore();
     }
     if (far) {
       // Far legs sit in Olive's own shadow.
-      ctx.save();
-      ctx.fillStyle = "rgba(30, 24, 48, 0.3)";
+      ctx.fillStyle = "rgba(34, 26, 46, 0.28)";
       ctx.fill(path);
       ctx.fill(paw);
-      ctx.restore();
     }
   }
 
   private tailPoints(f: Frame): V[] {
-    const base = add(f.hip, add(mul(f.fwd, -9), mul(f.up, 5)));
-    const pts: V[] = [base];
-    let cur = base;
+    const b = add(f.hip, add(mul(f.fwd, -9), mul(f.up, 5)));
+    const pts: V[] = [b];
+    let cur = b;
     // On the ground the tail lies along the floor instead of through it.
     const floor = this.air < 0.5 ? -3.4 : Infinity;
     for (let i = 0; i < TAIL_N; i++) {
@@ -1193,22 +1870,19 @@ export class Olive {
   }
 
   private drawTail(ctx: CanvasRenderingContext2D, pts: V[]) {
-    const hw = pts.map((_, i) => {
-      const q = i / (pts.length - 1);
-      return lerp(4, 3.1, q);
-    });
+    const hw = pts.map((_, i) => lerp(4.1, 3.3, i / (pts.length - 1)) + (i % 2 ? 0.25 : -0.1));
     const tip = pts[pts.length - 1]!;
     const dir = norm(sub(tip, pts[pts.length - 2]!));
-    const path = this.limbPath([...pts, add(tip, mul(dir, 2.6))], [...hw, 1.6]);
+    const path = this.limbPath([...pts, add(tip, mul(dir, 2.8))], [...hw, 1.7]);
     ctx.save();
     ctx.fillStyle = C.tabby;
     ctx.fill(path);
     ctx.clip(path);
-    this.furTexture(ctx, path, 0.25);
+    this.furTexture(ctx, path, 0.24);
     // Rings, then the dark tip.
     ctx.strokeStyle = C.stripe;
-    ctx.lineWidth = 2.6;
-    ctx.globalAlpha = 0.8;
+    ctx.lineWidth = 2.5;
+    ctx.globalAlpha = 0.78;
     for (let i = 2; i < pts.length - 2; i += 2) {
       const a = pts[i]!;
       const t = norm(sub(pts[i + 1]!, a));
@@ -1226,11 +1900,10 @@ export class Olive {
     for (let i = k0 + 1; i < pts.length; i++) ctx.lineTo(pts[i]!.x, pts[i]!.y);
     ctx.lineTo(tip.x + dir.x * 4, tip.y + dir.y * 4);
     ctx.stroke();
-    // Light along the upper side.
     const mid = pts[Math.floor(pts.length / 2)]!;
     const g = ctx.createLinearGradient(mid.x, mid.y - 6, mid.x, mid.y + 6);
     g.addColorStop(0, "rgba(255, 236, 200, 0.2)");
-    g.addColorStop(1, "rgba(40, 30, 60, 0.2)");
+    g.addColorStop(1, "rgba(40, 30, 60, 0.22)");
     ctx.fillStyle = g;
     ctx.fill(path);
     ctx.restore();
@@ -1241,28 +1914,26 @@ export class Olive {
     const a = add(f.shoulder, mul(f.up, 2));
     const b = head.pos;
     ctx.strokeStyle = C.tabby;
-    ctx.lineWidth = 21;
+    ctx.lineWidth = 20;
     line(ctx, a, b);
     const down = mul(f.up, -1);
     ctx.strokeStyle = C.white;
-    ctx.lineWidth = 15;
+    ctx.lineWidth = 14;
     line(ctx, add(add(a, mul(down, 6)), mul(f.fwd, 4)), add(add(b, mul(down, 6)), mul(f.fwd, 2)));
-    // Two dark bars across the nape.
     ctx.save();
     ctx.strokeStyle = C.stripe;
     ctx.globalAlpha = 0.5;
     ctx.lineWidth = 2;
-    const d = norm(sub(b, a));
-    const n = vec(d.y, -d.x);
+    const dd = norm(sub(b, a));
+    const n = vec(dd.y, -dd.x);
     for (const q of [0.3, 0.6]) {
       const c = lerpV(a, b, q);
-      line(ctx, add(c, mul(n, 10)), add(c, mul(n, 3)));
+      line(ctx, add(c, mul(n, 9.5)), add(c, mul(n, 3)));
     }
     ctx.restore();
   }
 
   private drawJawShadow(ctx: CanvasRenderingContext2D, head: { pos: V; angle: number }) {
-    // Separates the white chin from the white bib.
     const c = add(head.pos, rot(vec(3, 13), head.angle));
     const g = ctx.createRadialGradient(c.x, c.y, 1, c.x, c.y, 13);
     g.addColorStop(0, "rgba(70, 60, 100, 0.3)");
@@ -1275,11 +1946,13 @@ export class Olive {
 
   private drawHead(ctx: CanvasRenderingContext2D, pos: V, angle: number) {
     const t = this.t;
+    const p = this.pose;
     ctx.save();
     ctx.translate(pos.x, pos.y);
     ctx.rotate(angle);
+    ctx.scale(0.96, 0.96);
 
-    const earBack = this.pose.ears;
+    const earBack = clamp(p.ears + this.earLag, -0.3, 1.2);
     this.drawEar(ctx, false, earBack, this.earTwitch[1]!, t);
     this.drawEar(ctx, true, earBack, this.earTwitch[0]!, t);
 
@@ -1291,7 +1964,6 @@ export class Olive {
     head.bezierCurveTo(19, 0, 21.5, 2.5, 21.2, 6);
     head.bezierCurveTo(21, 9.5, 17.5, 11.5, 13, 12.2);
     head.bezierCurveTo(9, 15, 2, 15.2, -3, 13.2);
-    // Cheek ruff.
     head.bezierCurveTo(-7, 12.8, -9, 11.2, -12, 11.6);
     head.bezierCurveTo(-11.2, 10, -13.8, 9.2, -16.4, 8.6);
     head.bezierCurveTo(-15, 7.2, -17.6, 5.6, -17.5, 3.6);
@@ -1315,7 +1987,6 @@ export class Olive {
     ctx.beginPath();
     ctx.ellipse(13, -8.5, 4.5, 4, 0.2, 0, TAU);
     ctx.fill();
-
     // Forehead "M", crown stripes and cheek lines.
     ctx.strokeStyle = C.stripe;
     ctx.globalAlpha = 0.8;
@@ -1337,7 +2008,6 @@ export class Olive {
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
-
     // The narrow white blaze up the forehead, widening into muzzle and chin.
     ctx.fillStyle = C.white;
     ctx.beginPath();
@@ -1352,7 +2022,6 @@ export class Olive {
     ctx.bezierCurveTo(7.3, -14, 7.2, -16, 7.4, -18);
     ctx.closePath();
     ctx.fill();
-    // Shade under the jaw and a soft top light.
     const jaw = ctx.createLinearGradient(0, 4, 0, 15);
     jaw.addColorStop(0, "rgba(70, 60, 100, 0)");
     jaw.addColorStop(1, "rgba(70, 60, 100, 0.22)");
@@ -1364,15 +2033,17 @@ export class Olive {
     ctx.fillStyle = top;
     ctx.fillRect(-20, -20, 44, 20);
     ctx.restore();
-    // Faint line where the head overlaps the ears and neck.
     ctx.strokeStyle = C.inner;
     ctx.lineWidth = 0.8;
     ctx.stroke(head);
 
-    this.drawEye(ctx, -2.6, -4.2, 5.4, 5, -0.12, false);
-    this.drawEye(ctx, 12.7, -4.8, 3.9, 4.7, 0.12, true);
+    const lids = clamp(p.eyes, 0, 1);
+    this.drawEye(ctx, -2.6, -4.2, 5.4, 5, -0.12, false, lids);
+    this.drawEye(ctx, 12.7, -4.8, 3.9, 4.7, 0.12, true, lids);
 
-    // Nose, philtrum and a small mouth.
+    this.drawMouth(ctx, p.mouth, p.tongue);
+
+    // Nose.
     ctx.fillStyle = C.nose;
     ctx.strokeStyle = C.noseDark;
     ctx.lineWidth = 0.7;
@@ -1389,16 +2060,6 @@ export class Olive {
     ctx.beginPath();
     ctx.ellipse(16.6, 1.9, 1.3, 0.55, -0.1, 0, TAU);
     ctx.fill();
-    ctx.strokeStyle = "#8d6a62";
-    ctx.lineWidth = 0.8;
-    ctx.beginPath();
-    ctx.moveTo(17.5, 5);
-    ctx.lineTo(17.4, 7);
-    ctx.quadraticCurveTo(15.6, 9.2, 13.4, 8.2);
-    ctx.moveTo(17.4, 7);
-    ctx.quadraticCurveTo(19, 8.8, 20.6, 7.8);
-    ctx.stroke();
-    // Whisker pads.
     ctx.fillStyle = "rgba(120, 100, 110, 0.35)";
     for (const [x, y] of [
       [13.5, 5.6],
@@ -1411,8 +2072,9 @@ export class Olive {
       ctx.fill();
     }
 
-    // Whiskers, drifting a little.
-    const sway = Math.sin(t * 1.7) * 0.6 + this.glide * 2;
+    // Whiskers, drifting a little and swept back at speed.
+    const sweep = this.wGallop * 2 + this.air * 1.5;
+    const sway = Math.sin(t * 1.7) * 0.6 + sweep;
     ctx.strokeStyle = "rgba(255, 252, 245, 0.9)";
     ctx.lineWidth = 0.5;
     ctx.beginPath();
@@ -1431,6 +2093,50 @@ export class Olive {
     ctx.restore();
   }
 
+  private drawMouth(ctx: CanvasRenderingContext2D, open: number, tongue: number) {
+    if (open > 0.04) {
+      // A wide yawn or a bite: dark mouth, pink tongue, two little fangs.
+      const w = 3.4 + open * 2.2;
+      const h = 1 + open * 7;
+      ctx.fillStyle = C.mouth;
+      ctx.beginPath();
+      ctx.ellipse(16.4, 7.4 + h * 0.45, w, h * 0.55, 0, 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = C.tongue;
+      ctx.beginPath();
+      ctx.ellipse(16.4, 7.4 + h * 0.75, w * 0.7, h * 0.28, 0, 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = "#ffffff";
+      for (const x of [14.2, 18.6]) {
+        ctx.beginPath();
+        ctx.moveTo(x - 0.7, 7.6);
+        ctx.lineTo(x + 0.7, 7.6);
+        ctx.lineTo(x, 9 + open * 0.8);
+        ctx.closePath();
+        ctx.fill();
+      }
+    } else {
+      ctx.strokeStyle = "#8d6a62";
+      ctx.lineWidth = 0.8;
+      ctx.beginPath();
+      ctx.moveTo(17.5, 5);
+      ctx.lineTo(17.4, 7);
+      ctx.quadraticCurveTo(15.6, 9.2, 13.4, 8.2);
+      ctx.moveTo(17.4, 7);
+      ctx.quadraticCurveTo(19, 8.8, 20.6, 7.8);
+      ctx.stroke();
+    }
+    if (tongue > 0.05) {
+      ctx.fillStyle = C.tongue;
+      ctx.strokeStyle = "#c45d6b";
+      ctx.lineWidth = 0.4;
+      ctx.beginPath();
+      ctx.ellipse(17.6, 8.6 + tongue * 1.6, 1.6, 1 + tongue * 1.6, 0.2, 0, TAU);
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+
   private drawEar(
     ctx: CanvasRenderingContext2D,
     near: boolean,
@@ -1440,12 +2146,12 @@ export class Olive {
   ) {
     // The near ear sits toward the back of the head and shows its pink
     // inside; the far ear is foreshortened past the blaze.
-    const base = near ? vec(-6.5, -12.5) : vec(10.5, -13);
+    const b = near ? vec(-6.5, -12.5) : vec(10.5, -13);
     const spin = (near ? -0.2 : 0.16) - back * 0.95 - twitch * 0.35 * Math.sin(t * 40);
     ctx.save();
-    ctx.translate(base.x, base.y);
+    ctx.translate(b.x, b.y);
     ctx.rotate(spin);
-    ctx.scale(1, 1 - back * 0.3);
+    ctx.scale(1, 1 - clamp(back, 0, 1) * 0.3);
     const w = near ? 9.8 : 7.8;
     const h = near ? 16.5 : 15.5;
     const lean = near ? -2 : 2.5;
@@ -1454,8 +2160,6 @@ export class Olive {
     ear.bezierCurveTo(-w + 1, -h * 0.4, lean - 2.5, -h + 1, lean, -h);
     ear.bezierCurveTo(lean + 2.5, -h + 1.5, w - 1, -h * 0.4, w, 4.5);
     ear.closePath();
-    ctx.fillStyle = C.tabby;
-    ctx.fill(ear);
     ctx.save();
     ctx.clip(ear);
     const g0 = ctx.createLinearGradient(0, -h, 0, 4);
@@ -1468,7 +2172,6 @@ export class Olive {
     ctx.strokeStyle = C.inner;
     ctx.lineWidth = 0.8;
     ctx.stroke(ear);
-    // Inner ear: pale pink with a fringe of white fur.
     const inner = new Path2D();
     const s = near ? 0.66 : 0.45;
     const off = near ? 0.6 : 2.4;
@@ -1501,14 +2204,13 @@ export class Olive {
     ry: number,
     tilt: number,
     far: boolean,
+    lids: number,
   ) {
     const blink = this.blink > 0 ? Math.sin(this.blink * Math.PI) : 0;
-    const content = this.sit * 0.12 + this.happy * 0.35;
-    const open = clamp(1 - blink * 1.05 - content, 0, 1);
+    const open = clamp(lids - blink * 1.05 - (this.resting ? 0.1 : 0), 0, 1);
     ctx.save();
     ctx.translate(x, y);
     ctx.rotate(tilt);
-    // Dark rim and the liner flick at the outer corner.
     ctx.fillStyle = C.outline;
     ctx.beginPath();
     ctx.ellipse(0, 0, rx + 1, ry * Math.max(open, 0.12) + 0.9, 0, 0, TAU);
@@ -1532,7 +2234,6 @@ export class Olive {
       g.addColorStop(1, C.irisOut);
       ctx.fillStyle = g;
       ctx.fillRect(-rx - 1, -ry - 1, rx * 2 + 2, ry * 2 + 2);
-      // Iris fibres.
       ctx.strokeStyle = "rgba(90, 110, 30, 0.35)";
       ctx.lineWidth = 0.4;
       ctx.beginPath();
@@ -1547,7 +2248,6 @@ export class Olive {
       ctx.beginPath();
       ctx.ellipse(lx, ly, pw, ry * 0.86, 0, 0, TAU);
       ctx.fill();
-      // Upper lid shadow and two catchlights.
       ctx.fillStyle = "rgba(20, 14, 10, 0.32)";
       ctx.beginPath();
       ctx.ellipse(0, -ry * open * 1.05, rx * 1.2, ry * 0.55, 0, 0, TAU);
@@ -1563,6 +2263,7 @@ export class Olive {
       ctx.restore();
     }
     if (open < 0.95) {
+      // Closed or closing: a soft curved lid line, smiling when content.
       ctx.strokeStyle = C.outline;
       ctx.lineWidth = 1.2;
       ctx.beginPath();
@@ -1583,12 +2284,11 @@ export class Olive {
   private drawBow(ctx: CanvasRenderingContext2D, head: { pos: V; angle: number }) {
     // The collar wraps the throat just under the chin; the bow sits at the front.
     const a = head.angle * 0.6;
-    const knot = add(head.pos, rot(vec(5, 16.5), a));
+    const knot = add(head.pos, rot(vec(5, 16), a));
     ctx.save();
     ctx.translate(knot.x, knot.y);
     ctx.rotate(a + Math.sin(this.bowFlap * 0.5) * 0.04);
     ctx.scale(1.3, 1.3);
-    // Collar band.
     ctx.strokeStyle = C.navyEdge;
     ctx.lineWidth = 3.6;
     ctx.beginPath();
@@ -1598,11 +2298,10 @@ export class Olive {
     ctx.strokeStyle = C.navy;
     ctx.lineWidth = 2.2;
     ctx.stroke();
-    // Bell on its ring.
-    const swing = Math.sin(this.bowFlap * 0.7) * 0.3 - this.vx * 0.03;
+    // The bell swings on its ring.
     ctx.save();
     ctx.translate(-3, 1.2);
-    ctx.rotate(swing);
+    ctx.rotate(this.bell - a * 0.6);
     ctx.strokeStyle = C.bellDark;
     ctx.lineWidth = 0.6;
     ctx.beginPath();
@@ -1625,8 +2324,8 @@ export class Olive {
     ctx.stroke();
     ctx.restore();
 
-    // Bow: a larger back bow with a smaller one layered on top, then the knot.
-    const flap = 1 + Math.sin(this.bowFlap) * (0.04 + this.glide * 0.14);
+    // A larger back bow with a smaller one layered on top, then the knot.
+    const flap = 1 + Math.sin(this.bowFlap) * (0.03 + this.air * 0.08 + this.wGallop * 0.05);
     const loop = (dir: 1 | -1, w: number, h: number, back: boolean) => {
       const path = new Path2D();
       path.moveTo(0, -1.3);

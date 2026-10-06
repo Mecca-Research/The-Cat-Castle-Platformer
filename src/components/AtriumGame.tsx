@@ -6,7 +6,7 @@ import {
   type PointerEvent,
   type ReactNode,
 } from "react";
-import { ArrowDown, ArrowLeft, ArrowRight, Feather, PawPrint, Zap } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, PawPrint, Zap } from "lucide-react";
 import { startAtrium, type Engine, type Phase } from "@/game/atrium";
 import { COUNT } from "@/game/level";
 
@@ -19,8 +19,8 @@ const PAD = [
 const KEYS: { keys: string[]; action: string }[] = [
   { keys: ["A", "D"], action: "Move" },
   { keys: ["Shift"], action: "Run" },
-  { keys: ["Space"], action: "Jump, hold to glide" },
-  { keys: ["S"], action: "Drop or dive" },
+  { keys: ["Space"], action: "Jump (hold it)" },
+  { keys: ["S"], action: "Drop through" },
 ];
 
 function Key({ children }: { children: ReactNode }) {
@@ -106,10 +106,10 @@ export function AtriumGame() {
             <div className="flex gap-1" aria-hidden="true">
               {Array.from({ length: COUNT }, (_, i) => (
                 <span
-                  key={i}
+                  key={`${i}-${i < perch}`}
                   className={`h-1.5 w-3 rounded-full transition-colors duration-500 sm:w-4 ${
                     i < perch ? "bg-copper" : "bg-white/15"
-                  }`}
+                  } ${i === perch - 1 && perch > 1 ? "pip-in" : ""}`}
                 />
               ))}
             </div>
@@ -137,7 +137,8 @@ export function AtriumGame() {
       {phase !== "play" && (
         <div className="absolute inset-x-0 bottom-0 flex justify-center p-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
           <div
-            className={`w-full max-w-md rounded-3xl px-6 py-5 ${glass} bg-[rgba(14,24,22,0.72)]`}
+            key={phase}
+            className={`card-in w-full max-w-md rounded-3xl px-6 py-5 ${glass} bg-[rgba(14,24,22,0.72)]`}
           >
             <div className="mb-2 flex items-center gap-2 text-copper">
               <PawPrint className="size-4" aria-hidden="true" />
@@ -151,7 +152,7 @@ export function AtriumGame() {
             <p className="mt-2 text-[15px] leading-relaxed text-surface/75">
               {phase === "won"
                 ? `Nine perches in ${formatTime(time)}. The rest of the castle is still above this room.`
-                : "Take a run along the cushion and jump at the lip. Hold Jump to float down in a glide, and steer the landing."}
+                : "Hold Run (Shift) to build speed, then jump at the lip and keep holding. Steer on the way down to set the landing. Let go when you land so you don't slide off."}
             </p>
             <button
               type="button"
@@ -193,11 +194,11 @@ export function AtriumGame() {
             </button>
             <button
               type="button"
-              aria-label="Jump, hold to glide"
+              aria-label="Jump"
               className="grid size-16 min-w-20 place-items-center rounded-2xl bg-gradient-to-b from-[#e3a24a] to-copper text-ink shadow-lg active:scale-95"
               {...hold("Space")}
             >
-              <Feather className="size-6" aria-hidden="true" />
+              <ArrowUp className="size-6" aria-hidden="true" />
             </button>
           </div>
         </div>

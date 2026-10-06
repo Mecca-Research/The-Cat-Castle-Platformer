@@ -2,8 +2,16 @@ import { Sound } from "./audio.ts";
 import { Fx } from "./fx.ts";
 import { FLOOR_Y, GOAL, PLATFORMS, SUMMIT, WORLD_H, WORLD_W, type Platform } from "./level.ts";
 import { Olive } from "./olive.ts";
-import { makePlayer, stepPlayer, TUNING, type Input, type Player } from "./physics.ts";
-import { cameraYFor, Scene, type View } from "./scene.ts";
+import {
+  holdPlayer,
+  makePlayer,
+  NO_INPUT,
+  stepPlayer,
+  TUNING,
+  type Input,
+  type Player,
+} from "./physics.ts";
+import { Scene, type View } from "./scene.ts";
 
 export type Phase = "title" | "play" | "won";
 
@@ -15,9 +23,11 @@ export type Engine = {
 };
 
 const STEP = 1 / 60;
-/** Olive is drawn a little larger than her hitbox suggests, to show her off. */
-const OLIVE_SCALE = 1.2;
 const TAU = Math.PI * 2;
+/** Olive is drawn a little larger than her hitbox suggests, to show her off. */
+const OLIVE_SCALE = 1.22;
+/** How far ahead of Olive's middle her mouth reaches when she eats. */
+const MOUTH = 50;
 
 const KEYS = {
   left: ["ArrowLeft", "KeyA"],
@@ -37,7 +47,6 @@ declare global {
       getYaw: () => number;
       getSpeed: () => number;
       getVy: () => number;
-      getGliding: () => boolean;
       getPerch: () => number;
       warp: (perch: number) => void;
       setKeys: (codes: string[]) => void;
@@ -51,7 +60,7 @@ export async function startAtrium(
   onPhase: (phase: Phase) => void,
   onPerch?: (perch: number) => void,
 ): Promise<Engine> {
-  // Fonts aside, everything is drawn in code; give the first bake a frame.
+  // Everything is drawn in code; give the first bake a frame to land in.
   await new Promise((r) => requestAnimationFrame(() => r(null)));
 
   const scene = new Scene();
@@ -65,18 +74,16 @@ export async function startAtrium(
   let prev = { x: player.x, y: player.y, camX: 0, camY: 0 };
   let camX = 0;
   let camY = 0;
-  let anchorY = player.y + player.h;
-  let lookX = 120;
   let acc = 0;
   let last = performance.now();
   let raf = 0;
   let time = 0;
   let shake = 0;
-  let eaten = 0;
-  let wonAt = 0;
-  let highest = 0;
-  let streakT = 0;
-  let glideShow = 0;
+  let highest = 1;
+  // At the end Olive trots to the dish, faces it and eats.
+  let atDish = false;
+  let celebrated = false;
+  let lastChew = 0;
   // Dynamic resolution: if frames run long, render fewer pixels and let the
   // browser scale the canvas up. It only ever steps down, so it can't hunt.
   let quality = 1;
@@ -99,20 +106,15 @@ export async function startAtrium(
     return { viewW, viewH, cssW, cssH };
   }
 
-  function clampCam(x: number, y: number, viewW: number, viewH: number) {
-    return {
-      x: Math.max(0, Math.min(WORLD_W - viewW, x)),
-      y: Math.max(0, Math.min(Math.max(0, WORLD_H - viewH), y)),
-    };
-  }
-
   function reset() {
     player = makePlayer();
+    olive.reset();
     fx.clear();
     shake = 0;
-    eaten = 0;
-    highest = 0;
-    anchorY = player.y + player.h;
+    highest = 1;
+    atDish = false;
+    celebrated = false;
+    lastChew = 0;
     onPerch?.(1);
     setPhase("play");
   }
@@ -123,13 +125,13 @@ export async function startAtrium(
   }
 
   function readInput(): Input {
-    const playing = phase === "play";
+    if (phase !== "play") return NO_INPUT;
     return {
-      left: playing && any(KEYS.left),
-      right: playing && any(KEYS.right),
-      jump: playing && any(KEYS.jump),
-      down: playing && any(KEYS.down),
-      run: playing && any(KEYS.run),
+      left: any(KEYS.left),
+      right: any(KEYS.right),
+      jump: any(KEYS.jump),
+      down: any(KEYS.down),
+      run: any(KEYS.run),
     };
   }
 
@@ -137,100 +139,129 @@ export async function startAtrium(
     const cx = player.x + player.w / 2;
     olive.landed(impact);
     scene.press(p, impact);
-    if (impact > 4) {
+    sound.land(impact);
+    if (impact > 5) {
+      shake = Math.min(5, impact / 3);
       fx.dust(
         cx,
         p.y,
-        Math.round(3 + impact * 0.6),
+        Math.round(3 + impact * 0.5),
         30,
         0,
         p.kind === "floor" ? "#e8dcc6" : "#f3e6d2",
       );
-      if (impact > 9) {
-        fx.ring(cx, p.y, 18);
-        fx.fibres(cx, p.y, 3, p.side === "left" ? "#46a274" : "#c94d63");
-      }
-      if (player.diving || impact > 13) shake = Math.min(6, impact * 0.35);
+      if (impact > 10) fx.ring(cx, p.y, 18);
     }
-    sound.land(impact);
     if (p.kind === "perch" && p.index + 1 > highest) {
       highest = p.index + 1;
       onPerch?.(highest);
     }
   }
 
+  /** After the win: walk to the dish and turn to face it. */
+  function approachDish() {
+    const cx = player.x + player.w / 2;
+    const side = cx < GOAL.x ? -1 : 1;
+    const target = GOAL.x + side * MOUTH;
+    const dx = target - cx;
+    if (!atDish && Math.abs(dx) > 2) {
+      player.vx = Math.sign(dx) * Math.min(3.2, Math.abs(dx));
+      player.x += player.vx;
+      player.facing = dx > 0 ? 1 : -1;
+    } else {
+      player.vx = 0;
+      player.facing = side > 0 ? -1 : 1;
+      atDish = true;
+    }
+  }
+
   function step(dt: number) {
     time += dt;
     const input = readInput();
-    const groundBefore = player.ground;
-    const ev = stepPlayer(player, input);
-    const cx = player.x + player.w / 2;
-    const feet = player.y + player.h;
-
-    if (ev.jumped) {
-      olive.jumped();
-      const speed = Math.abs(player.vx);
-      fx.dust(cx - player.facing * 6, feet, 4 + Math.round(speed), 22, -player.facing);
-      sound.jump(speed);
-      if (groundBefore) scene.press(groundBefore, 2.5);
-    }
-    if (ev.landed && ev.landedOn) onLanded(ev.landedOn, ev.landed);
-    if (ev.skid) {
-      if (Math.random() < 0.5) fx.dust(cx + player.facing * 12, feet, 1, 14, player.facing);
-      if (player.groundFrames % 8 === 0) sound.skid();
-    }
-    if (ev.dropped) sound.drop();
-    if (ev.glideStart) fx.sparkles(cx, player.y, 3, 20);
-    if (ev.tired) fx.dust(cx, player.y + 10, 4, 20);
-    if (player.grounded && Math.abs(player.vx) > TUNING.walk + 1 && player.groundFrames % 9 === 0) {
-      fx.dust(cx - player.facing * 18, feet, 1, 10, -player.facing);
-    }
-    if (player.gliding) {
-      streakT -= dt;
-      if (streakT <= 0) {
-        streakT = 0.035;
-        fx.streak(
-          cx + (Math.random() - 0.5) * 60,
-          player.y - 10 + (Math.random() - 0.5) * 50,
-          player.vx,
-          player.vy,
-        );
+    if (phase === "play") {
+      const groundBefore = player.ground;
+      const ev = stepPlayer(player, input, dt);
+      const cx = player.x + player.w / 2;
+      const feet = player.y + player.h;
+      if (ev.jumped) {
+        olive.jumped();
+        const speed = Math.abs(player.vx);
+        fx.dust(cx - player.facing * 6, feet, 3 + Math.round(speed * 0.6), 22, -player.facing);
+        sound.jump(speed);
+        if (groundBefore) scene.press(groundBefore, 2.5);
       }
-    }
+      if (ev.dropped) {
+        olive.dropped();
+        sound.drop();
+      }
+      if (ev.landed && ev.landedOn) onLanded(ev.landedOn, ev.landed);
+      if (
+        player.grounded &&
+        player.turning &&
+        Math.abs(player.vx) > 3 &&
+        player.groundFrames % 4 === 0
+      ) {
+        fx.dust(cx + player.facing * 14, feet, 1, 14, player.facing);
+        if (player.groundFrames % 8 === 0) sound.skid();
+      }
+      if (
+        player.grounded &&
+        Math.abs(player.vx) > TUNING.walk + 1 &&
+        player.groundFrames % 9 === 0
+      ) {
+        fx.dust(cx - player.facing * 20, feet, 1, 10, -player.facing);
+      }
 
-    // Win: settle on the crown perch close to the salmon.
-    if (phase === "play" && player.grounded && player.ground === SUMMIT) {
-      if (Math.abs(cx - GOAL.x) < 64) {
+      // The original finish: on the crown perch, close enough to the salmon.
+      const sx = SUMMIT.x + SUMMIT.w * 0.62;
+      const sy = SUMMIT.y - 54;
+      const onSummit =
+        player.grounded &&
+        player.x + player.w > SUMMIT.x + 4 &&
+        player.x < SUMMIT.x + SUMMIT.w - 4 &&
+        Math.abs(player.y + player.h - SUMMIT.y) < 8;
+      const dx = sx - cx;
+      const dy = sy - (player.y + player.h * 0.35);
+      if (onSummit && dx * dx + dy * dy < 72 * 72) {
         setPhase("won");
-        wonAt = time;
-        olive.celebrate();
-        fx.sparkles(GOAL.x, GOAL.y - 20, 26, 30);
-        fx.hearts(cx, player.y - 30, 5);
+        fx.sparkles(GOAL.x, GOAL.y - 20, 18, 30);
         sound.win();
       }
+    } else {
+      holdPlayer(player, input);
+      if (phase === "won") approachDish();
     }
-    if (phase === "won") {
-      eaten = Math.min(1, eaten + dt * 1.8);
-      if (time - wonAt > 0.6 && Math.random() < dt * 1.2)
-        fx.hearts(cx + player.facing * 14, player.y - 40, 1);
+
+    if (phase === "won" && atDish) {
+      const chew = olive.eaten;
+      if (chew > lastChew + 0.18) {
+        lastChew = chew;
+        sound.nom();
+        fx.crumbs(GOAL.x, GOAL.y - 8, 3);
+      }
+      if (olive.finishedEating && !celebrated) {
+        celebrated = true;
+        fx.hearts(player.x + player.w / 2 + player.facing * 12, player.y - 30, 5);
+        sound.purr();
+      }
+      if (celebrated && Math.random() < dt * 1.1) {
+        fx.hearts(player.x + player.w / 2 + player.facing * 14, player.y - 40, 1);
+      }
     }
 
     fx.update(dt);
     scene.update(dt);
-    if (shake > 0) shake = Math.max(0, shake - dt * 20);
-    glideShow += ((player.stamina < TUNING.glideStamina ? 1 : 0) - glideShow) * Math.min(1, dt * 8);
+    if (shake > 0) shake = Math.max(0, shake - dt * 16);
 
-    // Camera: lead the run, and only follow jumps once they leave the band.
+    // The original camera: lead in the facing direction, ease toward Olive.
+    const focusX = player.x + player.w / 2 + player.facing * 170;
+    const focusY = player.y - 30;
     const { viewW, viewH } = viewSize();
-    const wantLook = player.facing * 110 + player.vx * 9;
-    lookX += (wantLook - lookX) * (1 - Math.exp(-dt * 2.5));
-    if (player.grounded) anchorY = feet;
-    else if (feet > anchorY) anchorY = feet;
-    else if (feet < anchorY - 150) anchorY = feet + 150;
-    const target = clampCam(cx + lookX - viewW * 0.5, cameraYFor(anchorY, viewH), viewW, viewH);
-    const falling = !player.grounded && player.vy > 6;
-    camX += (target.x - camX) * (1 - Math.exp(-dt * 4.5));
-    camY += (target.y - camY) * (1 - Math.exp(-dt * (falling ? 9 : 4.2)));
+    const destX = Math.max(0, Math.min(WORLD_W - viewW, focusX - viewW * 0.4));
+    const destY = Math.max(0, Math.min(WORLD_H - viewH, focusY - viewH * 0.58));
+    const k = 1 - Math.exp(-dt * 6.5);
+    camX += (destX - camX) * k;
+    camY += (destY - camY) * k;
   }
 
   function draw(alpha: number, frameDt: number) {
@@ -246,10 +277,11 @@ export async function startAtrium(
     }
     const k = bw / viewW;
     const lerp = (a: number, b: number) => a + (b - a) * alpha;
-    const sx = (Math.random() - 0.5) * shake;
-    const sy = (Math.random() - 0.5) * shake;
-    const cam = clampCam(lerp(prev.camX, camX) + sx, lerp(prev.camY, camY) + sy, viewW, viewH);
-    const view: View = { camX: cam.x, camY: cam.y, viewW, viewH, k };
+    const jx = (Math.random() - 0.5) * shake;
+    const jy = (Math.random() - 0.5) * shake;
+    const camLX = Math.max(0, Math.min(WORLD_W - viewW, lerp(prev.camX, camX) + jx));
+    const camLY = Math.max(0, Math.min(Math.max(0, WORLD_H - viewH), lerp(prev.camY, camY) + jy));
+    const view: View = { camX: camLX, camY: camLY, viewW, viewH, k };
     scene.prepare(view);
 
     ctx.imageSmoothingEnabled = true;
@@ -257,7 +289,7 @@ export async function startAtrium(
     ctx.setTransform(k, 0, 0, k, 0, 0);
     scene.drawBackdrop(ctx, view, time);
 
-    ctx.setTransform(k, 0, 0, k, -cam.x * k, -cam.y * k);
+    ctx.setTransform(k, 0, 0, k, -camLX * k, -camLY * k);
     scene.drawWorld(ctx, view, time);
 
     const px = lerp(prev.x, player.x);
@@ -265,38 +297,39 @@ export async function startAtrium(
     const cx = px + player.w / 2;
     const feet = py + player.h + (player.grounded ? scene.dipOf(player.ground) * 0.3 : 0);
 
+    const playing = phase === "play";
     olive.update(frameDt, {
       vx: player.vx,
       vy: player.vy,
       grounded: player.grounded,
-      gliding: player.gliding,
-      diving: player.diving,
-      skidding: player.skidding,
-      stamina: player.stamina / TUNING.glideStamina,
-      rest: phase !== "play",
-      busy: phase === "play" && (any(KEYS.left) || any(KEYS.right) || any(KEYS.jump)),
+      turning: player.turning,
+      facing: player.facing,
+      worldX: cx,
+      scale: OLIVE_SCALE,
+      rest: phase === "title",
+      eat: phase === "won" && atDish,
+      busy: playing && (any(KEYS.left) || any(KEYS.right) || any(KEYS.jump) || any(KEYS.down)),
       look:
         player.ground === SUMMIT || phase === "won"
           ? { x: (GOAL.x - cx) * player.facing, y: GOAL.y - feet }
           : null,
     });
-    olive.prepare(ctx, cx, feet, player.facing, OLIVE_SCALE);
+    olive.prepare(ctx, cx, feet, OLIVE_SCALE);
     const floorGap = FLOOR_Y - feet;
     if (floorGap < 160) olive.reflect(ctx, FLOOR_Y, 0.22 * (1 - floorGap / 160));
+
     scene.drawCushions(ctx, view);
     drawShadow(ctx, cx, feet);
-    scene.drawGoal(ctx, time, eaten);
+    scene.drawGoal(ctx, time, olive.eaten);
     fx.drawBack(ctx);
     olive.composite(ctx);
     fx.drawFront(ctx);
-    drawGlideMeter(ctx, cx, py);
 
     ctx.setTransform(k, 0, 0, k, 0, 0);
-    scene.drawFront(ctx, view, time, player.gliding ? 1 : 0);
-    sound.setWind(player.gliding ? Math.min(1, 0.4 + Math.abs(player.vx) / 10) : 0);
+    scene.drawFront(ctx, view, time);
   }
 
-  /** A soft shadow on whatever Olive would land on, to judge the drop. */
+  /** A soft shadow under Olive on whatever is below her. */
   function drawShadow(ctx: CanvasRenderingContext2D, cx: number, feet: number) {
     let below: Platform | null = null;
     for (const p of PLATFORMS) {
@@ -309,7 +342,7 @@ export async function startAtrium(
     const fade = Math.max(0, 1 - h / 520);
     if (fade <= 0) return;
     const y = below.y + scene.dipOf(below) * 0.3 + (below.kind === "floor" ? 2 : -1);
-    const rx = 30 * (0.55 + 0.45 * fade);
+    const rx = 32 * (0.55 + 0.45 * fade);
     const g = ctx.createRadialGradient(cx, y, 0, cx, y, rx);
     g.addColorStop(0, `rgba(12, 8, 14, ${0.42 * fade})`);
     g.addColorStop(1, "rgba(12, 8, 14, 0)");
@@ -319,30 +352,10 @@ export async function startAtrium(
     ctx.fill();
   }
 
-  /** A small ring over Olive's back that drains while she glides. */
-  function drawGlideMeter(ctx: CanvasRenderingContext2D, cx: number, top: number) {
-    if (glideShow < 0.02) return;
-    const left = player.stamina / TUNING.glideStamina;
-    const x = cx - player.facing * 16;
-    const y = top - 46;
-    ctx.save();
-    ctx.globalAlpha = glideShow;
-    ctx.lineCap = "round";
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = "rgba(20, 14, 10, 0.45)";
-    ctx.beginPath();
-    ctx.arc(x, y, 7, 0, TAU);
-    ctx.stroke();
-    ctx.strokeStyle = left > 0.3 ? "#fff1cf" : "#ff8a7a";
-    ctx.beginPath();
-    ctx.arc(x, y, 7, -Math.PI / 2, -Math.PI / 2 + TAU * left);
-    ctx.stroke();
-    ctx.restore();
-  }
-
   function frameLoop(now: number) {
     const raw = (now - last) / 1000;
-    const delta = Math.min(0.1, raw);
+    // The original pacing: at most 50 ms of game time and five steps a frame.
+    const delta = Math.min(0.05, raw);
     last = now;
     if (raw < 0.25) {
       judged += raw;
@@ -355,18 +368,17 @@ export async function startAtrium(
     }
     acc += delta;
     let guard = 0;
-    while (acc >= STEP && guard < 6) {
+    while (acc >= STEP && guard < 5) {
       prev = { x: player.x, y: player.y, camX, camY };
       step(STEP);
       acc -= STEP;
       guard++;
     }
-    if (guard >= 6) acc = 0;
     // A respawn or reset should not smear across the screen.
     if (Math.abs(prev.y - player.y) > 200 || Math.abs(prev.x - player.x) > 200) {
       prev = { x: player.x, y: player.y, camX, camY };
     }
-    draw(acc / STEP, delta);
+    draw(Math.min(1, acc / STEP), delta);
     window.__controlsTest = probe;
     raf = requestAnimationFrame(frameLoop);
   }
@@ -390,6 +402,13 @@ export async function startAtrium(
   window.addEventListener("keyup", onKeyUp);
   window.addEventListener("blur", onBlur);
 
+  function placeCamera() {
+    const { viewW, viewH } = viewSize();
+    camX = Math.max(0, Math.min(WORLD_W - viewW, player.x - viewW * 0.28));
+    camY = Math.max(0, Math.min(WORLD_H - viewH, player.y - viewH * 0.62));
+    prev = { x: player.x, y: player.y, camX, camY };
+  }
+
   const probe = {
     getX: () => player.x,
     getY: () => player.y,
@@ -398,7 +417,6 @@ export async function startAtrium(
     getYaw: () => player.facing,
     getSpeed: () => Math.abs(player.vx),
     getVy: () => player.vy,
-    getGliding: () => player.gliding,
     getPerch: () => (player.ground?.kind === "perch" ? player.ground.index + 1 : 0),
     setKeys: (codes: string[]) => {
       injected.clear();
@@ -415,21 +433,12 @@ export async function startAtrium(
       player.y = p.y - player.h;
       player.ground = p;
       player.onSolid = p.solid;
-      anchorY = p.y;
-      const { viewW, viewH } = viewSize();
-      const c = clampCam(player.x + lookX - viewW * 0.5, cameraYFor(anchorY, viewH), viewW, viewH);
-      camX = c.x;
-      camY = c.y;
-      prev = { x: player.x, y: player.y, camX, camY };
+      placeCamera();
     },
   };
   window.__controlsTest = probe;
 
-  const { viewW, viewH } = viewSize();
-  const start = clampCam(player.x + lookX - viewW * 0.5, cameraYFor(anchorY, viewH), viewW, viewH);
-  camX = start.x;
-  camY = start.y;
-  prev = { x: player.x, y: player.y, camX, camY };
+  placeCamera();
   onPhase("title");
   raf = requestAnimationFrame(frameLoop);
 
