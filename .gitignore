@@ -1,0 +1,15 @@
+node_modules
+dist
+dist-pages
+.output
+.vinxi
+.tanstack
+.env
+.env.*
+.grok
+AGENTS.md
+artifacts
+attachments
+screenshots
+*.log
+.DS_Store
