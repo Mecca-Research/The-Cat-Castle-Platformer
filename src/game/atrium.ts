@@ -1,3 +1,10 @@
+import { Sound } from "./audio.ts";
+import { Fx } from "./fx.ts";
+import { FLOOR_Y, GOAL, PLATFORMS, SUMMIT, WORLD_H, WORLD_W, type Platform } from "./level.ts";
+import { Olive } from "./olive.ts";
+import { makePlayer, stepPlayer, TUNING, type Input, type Player } from "./physics.ts";
+import { cameraYFor, Scene, type View } from "./scene.ts";
+
 export type Phase = "title" | "play" | "won";
 
 export type Engine = {
@@ -7,144 +14,18 @@ export type Engine = {
   reset: () => void;
 };
 
-type Kind = "floor" | "tree";
-type Side = "left" | "right";
-
-type Platform = {
-  x: number;
-  y: number;
-  w: number;
-  solid: boolean;
-  kind: Kind;
-  side: Side;
-};
-
-type Player = {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  vx: number;
-  vy: number;
-  facing: 1 | -1;
-  grounded: boolean;
-  onSolid: boolean;
-  drop: number;
-  coyote: number;
-  airLo: number;
-  airHi: number;
-  launchVx: number;
-  anim: "idle" | "run" | "jump";
-  frame: number;
-  frameT: number;
-  jumpT: number;
-  squash: number;
-};
-
-type Puff = { x: number; y: number; life: number; vx: number; vy: number; r: number; gold: boolean };
-
-const WORLD_H = 2400;
-const FLOOR_Y = 2160;
-const PERCH_W = 250;
-const GAP = 220;
-const MARGIN = 160;
-const LEFT_X = MARGIN;
-const RIGHT_X = LEFT_X + PERCH_W + GAP;
-const WORLD_W = RIGHT_X + PERCH_W + MARGIN;
-const RISE = 165;
-const FIRST = 152;
-const COUNT = 9;
-const PW = 42;
-const PH = 34;
-// Run is 20% faster than the Mario pass. The jump falls sooner, and the air
-// window opens on the way down so the landing can be steered.
-const WALK_VX = 5.04;
-const RUN_VX = 8.4;
-const ACCEL = 0.26;
-const FRICTION = 0.75;
-const PIVOT = 0.48;
-const JUMP_V = -14.4;
-const GRAV_RISE = 0.52;
-const GRAV_HANG = 0.58;
-const GRAV_FALL = 1.5;
-const APEX = 2.8;
-const MAX_FALL = 14.5;
-const BRAKE = 2.4;
-const EXTRA = 1.15;
-const FALL_DRIFT = 3.8;
-const RISE_STEER = 0.3;
-const FALL_STEER = 0.52;
-const COYOTE = 5;
 const STEP = 1 / 60;
+/** Olive is drawn a little larger than her hitbox suggests, to show her off. */
+const OLIVE_SCALE = 1.2;
+const TAU = Math.PI * 2;
 
-const LEFT_STAND = 0.058;
-const RIGHT_STAND = 0.069;
-
-function buildPlatforms(): Platform[] {
-  const list: Platform[] = [
-    { x: 0, y: FLOOR_Y, w: WORLD_W, solid: true, kind: "floor", side: "left" },
-  ];
-  for (let i = 0; i < COUNT; i++) {
-    const side: Side = i % 2 === 0 ? "left" : "right";
-    list.push({
-      x: side === "left" ? LEFT_X : RIGHT_X,
-      y: FLOOR_Y - FIRST - i * RISE,
-      w: PERCH_W,
-      solid: false,
-      kind: "tree",
-      side,
-    });
-  }
-  return list;
-}
-
-const PLATFORMS = buildPlatforms();
-const SUMMIT = PLATFORMS[PLATFORMS.length - 1]!;
-
-function approach(value: number, target: number, accel: number) {
-  if (value < target) return Math.min(target, value + accel);
-  if (value > target) return Math.max(target, value - accel);
-  return value;
-}
-
-function asset(path: string) {
-  const base = import.meta.env.BASE_URL || "/";
-  return `${base}${path.replace(/^\//, "")}`;
-}
-
-function loadImage(src: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error(`failed to load ${src}`));
-    img.src = src;
-  });
-}
-
-function makePlayer(): Player {
-  return {
-    x: LEFT_X + 6,
-    y: FLOOR_Y - FIRST - PH,
-    w: PW,
-    h: PH,
-    vx: 0,
-    vy: 0,
-    facing: 1,
-    grounded: true,
-    onSolid: true,
-    drop: 0,
-    coyote: COYOTE,
-    airLo: -4,
-    airHi: 4,
-    launchVx: 0,
-    anim: "idle",
-    frame: 0,
-    frameT: 0,
-    jumpT: 1,
-    squash: 0,
-  };
-}
+const KEYS = {
+  left: ["ArrowLeft", "KeyA"],
+  right: ["ArrowRight", "KeyD"],
+  jump: ["Space", "KeyW", "ArrowUp", "KeyZ"],
+  down: ["KeyS", "ArrowDown"],
+  run: ["ShiftLeft", "ShiftRight", "KeyX", "KeyB"],
+};
 
 declare global {
   interface Window {
@@ -155,6 +36,10 @@ declare global {
       getGrounded: () => boolean;
       getYaw: () => number;
       getSpeed: () => number;
+      getVy: () => number;
+      getGliding: () => boolean;
+      getPerch: () => number;
+      warp: (perch: number) => void;
       setKeys: (codes: string[]) => void;
       getPhase: () => Phase;
     };
@@ -164,309 +49,46 @@ declare global {
 export async function startAtrium(
   canvas: HTMLCanvasElement,
   onPhase: (phase: Phase) => void,
+  onPerch?: (perch: number) => void,
 ): Promise<Engine> {
-  const [idle, run, jump, perchL, perchR, sushiImg, bgLower, bgMid, bgUpper] = await Promise.all([
-    Promise.all([1, 2, 3, 4].map((n) => loadImage(asset(`/game/olive-idle-${n}.png?v=4`)))),
-    Promise.all([1, 2, 3, 4, 5, 6].map((n) => loadImage(asset(`/game/olive-run-${n}.png?v=4`)))),
-    Promise.all([1, 2, 3, 4].map((n) => loadImage(asset(`/game/olive-jump-${n}.png?v=4`)))),
-    loadImage(asset("/game/perch-left.png")),
-    loadImage(asset("/game/perch-right.png")),
-    loadImage(asset("/game/sushi.png")),
-    loadImage(asset("/game/bg-lower.jpg")),
-    loadImage(asset("/game/bg-mid.jpg")),
-    loadImage(asset("/game/bg-upper.jpg")),
-  ]);
+  // Fonts aside, everything is drawn in code; give the first bake a frame.
+  await new Promise((r) => requestAnimationFrame(() => r(null)));
 
-  const sheets = { idle, run, jump };
+  const scene = new Scene();
+  const olive = new Olive();
+  const fx = new Fx();
+  const sound = new Sound();
   const real = new Set<string>();
   const injected = new Set<string>();
   let phase: Phase = "title";
-  let player = makePlayer();
+  let player: Player = makePlayer();
+  let prev = { x: player.x, y: player.y, camX: 0, camY: 0 };
   let camX = 0;
   let camY = 0;
+  let anchorY = player.y + player.h;
+  let lookX = 120;
   let acc = 0;
   let last = performance.now();
   let raf = 0;
-  let wasJump = false;
-  let wasDown = false;
   let time = 0;
   let shake = 0;
-  const puffs: Puff[] = [];
-  let audio: AudioContext | null = null;
+  let eaten = 0;
+  let wonAt = 0;
+  let highest = 0;
+  let streakT = 0;
+  let glideShow = 0;
+  // Dynamic resolution: if frames run long, render fewer pixels and let the
+  // browser scale the canvas up. It only ever steps down, so it can't hunt.
+  let quality = 1;
+  let slow = 0;
+  let judged = 0;
 
-  const mineX = () => player.x;
   const held = (code: string) => real.has(code) || injected.has(code);
+  const any = (codes: string[]) => codes.some(held);
 
   function setPhase(next: Phase) {
     phase = next;
     onPhase(next);
-  }
-
-  function tone(freq: number, dur: number, type: OscillatorType, gain = 0.05) {
-    if (!audio) return;
-    const o = audio.createOscillator();
-    const g = audio.createGain();
-    o.type = type;
-    o.frequency.value = freq;
-    g.gain.value = gain;
-    g.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + dur);
-    o.connect(g);
-    g.connect(audio.destination);
-    o.start();
-    o.stop(audio.currentTime + dur);
-  }
-
-  function unlock() {
-    if (!audio) audio = new AudioContext();
-    if (audio.state === "suspended") void audio.resume();
-  }
-
-  function burst(x: number, y: number, n: number, gold = false) {
-    for (let i = 0; i < n; i++) {
-      puffs.push({
-        x,
-        y,
-        life: 0.4 + Math.random() * 0.28,
-        vx: (Math.random() - 0.5) * 180,
-        vy: -30 - Math.random() * 140,
-        r: 2.5 + Math.random() * 3.5,
-        gold,
-      });
-    }
-  }
-
-  function reset() {
-    player = makePlayer();
-    puffs.length = 0;
-    wasJump = false;
-    wasDown = false;
-    shake = 0;
-    setPhase("play");
-  }
-
-  function begin() {
-    unlock();
-    if (phase === "title") setPhase("play");
-  }
-
-  function step(dt: number) {
-    time += dt;
-    const playing = phase === "play";
-    const left = playing && (held("ArrowLeft") || held("KeyA"));
-    const right = playing && (held("ArrowRight") || held("KeyD"));
-    const jumpNow = playing && (held("Space") || held("KeyW") || held("ArrowUp") || held("KeyZ"));
-    const downNow = playing && (held("KeyS") || held("ArrowDown"));
-    const runHeld =
-      playing && (held("ShiftLeft") || held("ShiftRight") || held("KeyX") || held("KeyB"));
-
-    if (!playing) {
-      player.vx = 0;
-      player.vy = 0;
-      player.grounded = true;
-    } else {
-      let target = 0;
-      if (right) target = runHeld ? RUN_VX : WALK_VX;
-      else if (left) target = runHeld ? -RUN_VX : -WALK_VX;
-      if (target !== 0) player.facing = target > 0 ? 1 : -1;
-
-      if (player.grounded) {
-        if (target !== 0) {
-          const turning = Math.sign(target) !== Math.sign(player.vx) && Math.abs(player.vx) > 0.2;
-          player.vx = approach(player.vx, target, turning ? PIVOT : ACCEL);
-        } else {
-          player.vx = approach(player.vx, 0, FRICTION);
-        }
-        player.launchVx = player.vx;
-        player.airLo = player.vx - (BRAKE + 1);
-        player.airHi = player.vx + (BRAKE + 1);
-      }
-
-      const jumpEdge = jumpNow && !wasJump;
-      const jumped = jumpEdge && player.drop <= 0 && (player.grounded || player.coyote > 0);
-      if (jumped) {
-        const spd = player.vx;
-        player.vy = JUMP_V;
-        player.grounded = false;
-        player.coyote = 0;
-        player.launchVx = spd;
-        player.airLo = spd - (spd >= 0 ? BRAKE : EXTRA);
-        player.airHi = spd + (spd >= 0 ? EXTRA : BRAKE);
-        if (Math.abs(spd) < 2.2) {
-          player.airLo = Math.min(player.airLo, -2.6);
-          player.airHi = Math.max(player.airHi, 2.6);
-        }
-        player.jumpT = 0;
-        player.squash = 0.16;
-        tone(540, 0.07, "triangle", 0.035);
-      }
-
-      if (!player.grounded) {
-        const falling = player.vy > 0.4;
-        const steer = falling ? FALL_STEER : RISE_STEER;
-        if (left) player.vx -= steer;
-        else if (right) player.vx += steer;
-        if (falling) {
-          player.airLo = Math.max(player.launchVx - FALL_DRIFT, player.airLo - 0.16);
-          player.airHi = Math.min(player.launchVx + FALL_DRIFT, player.airHi + 0.16);
-        }
-        player.vx = Math.max(player.airLo, Math.min(player.airHi, player.vx));
-      }
-
-      player.x += player.vx;
-      if (player.x < 8) {
-        player.x = 8;
-        player.vx = 0;
-      }
-      if (player.x + player.w > WORLD_W - 8) {
-        player.x = WORLD_W - 8 - player.w;
-        player.vx = 0;
-      }
-
-      if (player.grounded && player.drop <= 0) {
-        let on = false;
-        const bottom = player.y + player.h;
-        for (const p of PLATFORMS) {
-          const overlap = player.x + player.w > p.x + 2 && player.x < p.x + p.w - 2;
-          if (overlap && Math.abs(bottom - p.y) <= 3) {
-            on = true;
-            player.onSolid = p.solid;
-            break;
-          }
-        }
-        if (!on) {
-          player.grounded = false;
-          player.onSolid = false;
-          player.vy = 0;
-          player.coyote = COYOTE;
-        }
-      }
-
-      if (downNow && !wasDown && player.grounded && !player.onSolid) {
-        player.drop = 0.16;
-        player.y += 8;
-        player.vy = 1;
-        player.grounded = false;
-      }
-
-      const prevBottom = player.y + player.h;
-      if (!jumped && !player.grounded) {
-        const grav = jumpNow && player.vy < -APEX ? GRAV_RISE : jumpNow && player.vy < 0 ? GRAV_HANG : GRAV_FALL;
-        player.vy = Math.min(MAX_FALL, player.vy + grav);
-        player.y += player.vy;
-        player.coyote = Math.max(0, player.coyote - 1);
-      } else if (player.grounded) {
-        player.vy = 0;
-        player.coyote = COYOTE;
-      }
-
-      let landed: Platform | null = null;
-      if (player.drop > 0) player.drop -= dt;
-      else if (!jumped && player.vy >= 0) {
-        for (const p of PLATFORMS) {
-          const overlap = player.x + player.w > p.x + 2 && player.x < p.x + p.w - 2;
-          if (!overlap) continue;
-          if (prevBottom <= p.y + 5 && player.y + player.h >= p.y && player.y + player.h <= p.y + 28) {
-            if (!landed || p.y < landed.y) landed = p;
-          }
-        }
-      }
-
-      if (landed) {
-        const impact = player.vy;
-        player.y = landed.y - player.h;
-        player.vy = 0;
-        if (!player.grounded && impact > 5) {
-          player.squash = -0.14;
-          shake = Math.min(5, impact / 3);
-          burst(player.x + player.w / 2, landed.y, 4, true);
-          tone(160, 0.04, "sine", 0.025);
-        }
-        player.grounded = true;
-        player.onSolid = landed.solid;
-        player.coyote = COYOTE;
-      } else if (!player.grounded) {
-        player.onSolid = false;
-      }
-
-      if (player.y > WORLD_H + 40) {
-        player.x = LEFT_X + 6;
-        player.y = FLOOR_Y - FIRST - PH;
-        player.vx = 0;
-        player.vy = 0;
-        player.grounded = true;
-      }
-
-      const sx = SUMMIT.x + SUMMIT.w * 0.62;
-      const sy = SUMMIT.y - 54;
-      const onSummit =
-        player.grounded &&
-        player.x + player.w > SUMMIT.x + 4 &&
-        player.x < SUMMIT.x + SUMMIT.w - 4 &&
-        Math.abs(player.y + player.h - SUMMIT.y) < 8;
-      const dx = sx - (player.x + player.w / 2);
-      const dy = sy - (player.y + player.h * 0.35);
-      if (onSummit && dx * dx + dy * dy < 72 * 72) {
-        setPhase("won");
-        burst(sx, sy, 18, true);
-        tone(620, 0.1, "triangle", 0.045);
-        tone(830, 0.16, "sine", 0.035);
-      }
-    }
-
-    player.jumpT += dt;
-    if (!player.grounded && playing) {
-      player.anim = "jump";
-      if (player.jumpT < 0.06) player.frame = 0;
-      else if (player.vy < -APEX) player.frame = 1;
-      else if (player.vy < 2) player.frame = 2;
-      else player.frame = 3;
-    } else if (Math.abs(player.vx) > ACCEL) {
-      if (player.anim !== "run") {
-        player.anim = "run";
-        player.frameT = 0;
-      }
-      player.frameT += 1;
-      const units = Math.min(40, Math.round(Math.abs(player.vx) / ACCEL));
-      const delay = Math.max(4, 12 - Math.floor((units * 8) / 40));
-      if (player.frameT >= delay) {
-        player.frameT = 0;
-        player.frame = (player.frame + 1) % run.length;
-      }
-    } else {
-      if (player.anim !== "idle") {
-        player.anim = "idle";
-        player.frame = 0;
-        player.frameT = 0;
-      }
-      player.frameT += dt;
-      if (player.frameT > 0.2) {
-        player.frameT = 0;
-        player.frame = (player.frame + 1) % idle.length;
-      }
-    }
-
-    player.squash += (0 - player.squash) * Math.min(1, dt * 12);
-    for (let i = puffs.length - 1; i >= 0; i--) {
-      const puff = puffs[i]!;
-      puff.life -= dt;
-      puff.x += puff.vx * dt;
-      puff.y += puff.vy * dt;
-      puff.vy += 280 * dt;
-      if (puff.life <= 0) puffs.splice(i, 1);
-    }
-    if (shake > 0) shake = Math.max(0, shake - dt * 16);
-
-    wasJump = jumpNow;
-    wasDown = downNow;
-
-    const focusX = player.x + player.w / 2 + player.facing * 170;
-    const focusY = player.y - 30;
-    const { viewW, viewH } = viewSize();
-    const destX = Math.max(0, Math.min(WORLD_W - viewW, focusX - viewW * 0.4));
-    const destY = Math.max(0, Math.min(WORLD_H - viewH, focusY - viewH * 0.58));
-    const k = 1 - Math.exp(-dt * 6.5);
-    camX += (destX - camX) * k;
-    camY += (destY - camY) * k;
   }
 
   function viewSize() {
@@ -477,77 +99,144 @@ export async function startAtrium(
     return { viewW, viewH, cssW, cssH };
   }
 
-  function drawBand(
-    ctx: CanvasRenderingContext2D,
-    img: HTMLImageElement,
-    destY: number,
-    destH: number,
-    focus: number,
-  ) {
-    const scale = WORLD_W / img.width;
-    let srcH = destH / scale;
-    if (srcH > img.height) srcH = img.height;
-    const maxY = img.height - srcH;
-    const srcY = Math.max(0, Math.min(maxY, maxY * focus));
-    ctx.drawImage(img, 0, srcY, img.width, srcH, 0, destY, WORLD_W, destH);
+  function clampCam(x: number, y: number, viewW: number, viewH: number) {
+    return {
+      x: Math.max(0, Math.min(WORLD_W - viewW, x)),
+      y: Math.max(0, Math.min(Math.max(0, WORLD_H - viewH), y)),
+    };
   }
 
-  function drawPosts(ctx: CanvasRenderingContext2D, side: Side) {
-    const perches = PLATFORMS.filter((p) => p.kind === "tree" && p.side === side);
-    const top = Math.min(...perches.map((p) => p.y)) - 28;
-    const x0 = side === "left" ? LEFT_X : RIGHT_X;
-    const honey = side === "left";
-    const slots = [0.2, 0.5, 0.8];
-    for (const t of slots) {
-      const w = t === 0.5 ? 28 : 18;
-      const x = x0 + PERCH_W * t - w / 2;
-      const y = top;
-      const h = FLOOR_Y - top + 8;
-      const grad = ctx.createLinearGradient(x, y, x + w, y);
-      if (honey) {
-        grad.addColorStop(0, "#f3d7a2");
-        grad.addColorStop(0.45, "#d3924a");
-        grad.addColorStop(1, "#8d5524");
-      } else {
-        grad.addColorStop(0, "#a86448");
-        grad.addColorStop(0.5, "#6a3828");
-        grad.addColorStop(1, "#3c2018");
+  function reset() {
+    player = makePlayer();
+    fx.clear();
+    shake = 0;
+    eaten = 0;
+    highest = 0;
+    anchorY = player.y + player.h;
+    onPerch?.(1);
+    setPhase("play");
+  }
+
+  function begin() {
+    sound.unlock();
+    if (phase === "title") setPhase("play");
+  }
+
+  function readInput(): Input {
+    const playing = phase === "play";
+    return {
+      left: playing && any(KEYS.left),
+      right: playing && any(KEYS.right),
+      jump: playing && any(KEYS.jump),
+      down: playing && any(KEYS.down),
+      run: playing && any(KEYS.run),
+    };
+  }
+
+  function onLanded(p: Platform, impact: number) {
+    const cx = player.x + player.w / 2;
+    olive.landed(impact);
+    scene.press(p, impact);
+    if (impact > 4) {
+      fx.dust(
+        cx,
+        p.y,
+        Math.round(3 + impact * 0.6),
+        30,
+        0,
+        p.kind === "floor" ? "#e8dcc6" : "#f3e6d2",
+      );
+      if (impact > 9) {
+        fx.ring(cx, p.y, 18);
+        fx.fibres(cx, p.y, 3, p.side === "left" ? "#46a274" : "#c94d63");
       }
-      ctx.fillStyle = grad;
-      ctx.beginPath();
-      ctx.roundRect(x, y, w, h, 8);
-      ctx.fill();
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(x, y, w, h);
-      ctx.clip();
-      ctx.strokeStyle = honey ? "rgba(120, 72, 28, 0.28)" : "rgba(255, 196, 140, 0.16)";
-      ctx.lineWidth = 1.4;
-      for (let yy = y + 8; yy < y + h; yy += 16) {
-        ctx.beginPath();
-        ctx.moveTo(x - 2, yy);
-        ctx.lineTo(x + w + 2, yy + 9);
-        ctx.stroke();
-      }
-      ctx.restore();
-      ctx.fillStyle = honey ? "rgba(255, 236, 200, 0.35)" : "rgba(255, 210, 170, 0.18)";
-      ctx.fillRect(x + 3, y + 6, 3, h - 14);
+      if (player.diving || impact > 13) shake = Math.min(6, impact * 0.35);
     }
-    const baseW = PERCH_W * 0.72;
-    const bx = x0 + (PERCH_W - baseW) / 2;
-    const g = ctx.createLinearGradient(bx, FLOOR_Y - 18, bx, FLOOR_Y + 22);
-    g.addColorStop(0, honey ? "#e7c48a" : "#7a4634");
-    g.addColorStop(1, honey ? "#8a5428" : "#3a2018");
-    ctx.fillStyle = g;
-    ctx.beginPath();
-    ctx.roundRect(bx, FLOOR_Y - 16, baseW, 36, 10);
-    ctx.fill();
+    sound.land(impact);
+    if (p.kind === "perch" && p.index + 1 > highest) {
+      highest = p.index + 1;
+      onPerch?.(highest);
+    }
   }
 
-  function draw() {
+  function step(dt: number) {
+    time += dt;
+    const input = readInput();
+    const groundBefore = player.ground;
+    const ev = stepPlayer(player, input);
+    const cx = player.x + player.w / 2;
+    const feet = player.y + player.h;
+
+    if (ev.jumped) {
+      olive.jumped();
+      const speed = Math.abs(player.vx);
+      fx.dust(cx - player.facing * 6, feet, 4 + Math.round(speed), 22, -player.facing);
+      sound.jump(speed);
+      if (groundBefore) scene.press(groundBefore, 2.5);
+    }
+    if (ev.landed && ev.landedOn) onLanded(ev.landedOn, ev.landed);
+    if (ev.skid) {
+      if (Math.random() < 0.5) fx.dust(cx + player.facing * 12, feet, 1, 14, player.facing);
+      if (player.groundFrames % 8 === 0) sound.skid();
+    }
+    if (ev.dropped) sound.drop();
+    if (ev.glideStart) fx.sparkles(cx, player.y, 3, 20);
+    if (ev.tired) fx.dust(cx, player.y + 10, 4, 20);
+    if (player.grounded && Math.abs(player.vx) > TUNING.walk + 1 && player.groundFrames % 9 === 0) {
+      fx.dust(cx - player.facing * 18, feet, 1, 10, -player.facing);
+    }
+    if (player.gliding) {
+      streakT -= dt;
+      if (streakT <= 0) {
+        streakT = 0.035;
+        fx.streak(
+          cx + (Math.random() - 0.5) * 60,
+          player.y - 10 + (Math.random() - 0.5) * 50,
+          player.vx,
+          player.vy,
+        );
+      }
+    }
+
+    // Win: settle on the crown perch close to the salmon.
+    if (phase === "play" && player.grounded && player.ground === SUMMIT) {
+      if (Math.abs(cx - GOAL.x) < 64) {
+        setPhase("won");
+        wonAt = time;
+        olive.celebrate();
+        fx.sparkles(GOAL.x, GOAL.y - 20, 26, 30);
+        fx.hearts(cx, player.y - 30, 5);
+        sound.win();
+      }
+    }
+    if (phase === "won") {
+      eaten = Math.min(1, eaten + dt * 1.8);
+      if (time - wonAt > 0.6 && Math.random() < dt * 1.2)
+        fx.hearts(cx + player.facing * 14, player.y - 40, 1);
+    }
+
+    fx.update(dt);
+    scene.update(dt);
+    if (shake > 0) shake = Math.max(0, shake - dt * 20);
+    glideShow += ((player.stamina < TUNING.glideStamina ? 1 : 0) - glideShow) * Math.min(1, dt * 8);
+
+    // Camera: lead the run, and only follow jumps once they leave the band.
+    const { viewW, viewH } = viewSize();
+    const wantLook = player.facing * 110 + player.vx * 9;
+    lookX += (wantLook - lookX) * (1 - Math.exp(-dt * 2.5));
+    if (player.grounded) anchorY = feet;
+    else if (feet > anchorY) anchorY = feet;
+    else if (feet < anchorY - 150) anchorY = feet + 150;
+    const target = clampCam(cx + lookX - viewW * 0.5, cameraYFor(anchorY, viewH), viewW, viewH);
+    const falling = !player.grounded && player.vy > 6;
+    camX += (target.x - camX) * (1 - Math.exp(-dt * 4.5));
+    camY += (target.y - camY) * (1 - Math.exp(-dt * (falling ? 9 : 4.2)));
+  }
+
+  function draw(alpha: number, frameDt: number) {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2) * quality;
     const { viewW, viewH, cssW, cssH } = viewSize();
     const bw = Math.round(cssW * dpr);
     const bh = Math.round(cssH * dpr);
@@ -555,131 +244,140 @@ export async function startAtrium(
       canvas.width = bw;
       canvas.height = bh;
     }
-    ctx.setTransform(bw / viewW, 0, 0, bh / viewH, 0, 0);
+    const k = bw / viewW;
+    const lerp = (a: number, b: number) => a + (b - a) * alpha;
+    const sx = (Math.random() - 0.5) * shake;
+    const sy = (Math.random() - 0.5) * shake;
+    const cam = clampCam(lerp(prev.camX, camX) + sx, lerp(prev.camY, camY) + sy, viewW, viewH);
+    const view: View = { camX: cam.x, camY: cam.y, viewW, viewH, k };
+    scene.prepare(view);
+
     ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = "high";
-    const jx = (Math.random() - 0.5) * shake;
-    const jy = (Math.random() - 0.5) * shake;
-    const ox = Math.round(camX + jx);
-    const oy = Math.round(camY + jy);
+    ctx.imageSmoothingQuality = "low";
+    ctx.setTransform(k, 0, 0, k, 0, 0);
+    scene.drawBackdrop(ctx, view, time);
 
-    ctx.save();
-    ctx.translate(-ox, -oy);
+    ctx.setTransform(k, 0, 0, k, -cam.x * k, -cam.y * k);
+    scene.drawWorld(ctx, view, time);
 
-    const band = FLOOR_Y / 3;
-    drawBand(ctx, bgUpper, 0, band + 2, 0.2);
-    drawBand(ctx, bgMid, band, band + 2, 0.45);
-    drawBand(ctx, bgLower, band * 2, FLOOR_Y - band * 2 + 2, 0.28);
+    const px = lerp(prev.x, player.x);
+    const py = lerp(prev.y, player.y);
+    const cx = px + player.w / 2;
+    const feet = py + player.h + (player.grounded ? scene.dipOf(player.ground) * 0.3 : 0);
 
-    const sky = ctx.createLinearGradient(WORLD_W * 0.5, 0, WORLD_W * 0.5, FLOOR_Y);
-    sky.addColorStop(0, "rgba(255, 196, 120, 0.05)");
-    sky.addColorStop(0.5, "rgba(16, 48, 36, 0)");
-    sky.addColorStop(1, "rgba(12, 28, 22, 0.12)");
-    ctx.fillStyle = sky;
-    ctx.fillRect(0, 0, WORLD_W, FLOOR_Y);
+    olive.update(frameDt, {
+      vx: player.vx,
+      vy: player.vy,
+      grounded: player.grounded,
+      gliding: player.gliding,
+      diving: player.diving,
+      skidding: player.skidding,
+      stamina: player.stamina / TUNING.glideStamina,
+      rest: phase !== "play",
+      busy: phase === "play" && (any(KEYS.left) || any(KEYS.right) || any(KEYS.jump)),
+      look:
+        player.ground === SUMMIT || phase === "won"
+          ? { x: (GOAL.x - cx) * player.facing, y: GOAL.y - feet }
+          : null,
+    });
+    olive.prepare(ctx, cx, feet, player.facing, OLIVE_SCALE);
+    const floorGap = FLOOR_Y - feet;
+    if (floorGap < 160) olive.reflect(ctx, FLOOR_Y, 0.22 * (1 - floorGap / 160));
+    scene.drawCushions(ctx, view);
+    drawShadow(ctx, cx, feet);
+    scene.drawGoal(ctx, time, eaten);
+    fx.drawBack(ctx);
+    olive.composite(ctx);
+    fx.drawFront(ctx);
+    drawGlideMeter(ctx, cx, py);
 
-    drawPosts(ctx, "left");
-    drawPosts(ctx, "right");
+    ctx.setTransform(k, 0, 0, k, 0, 0);
+    scene.drawFront(ctx, view, time, player.gliding ? 1 : 0);
+    sound.setWind(player.gliding ? Math.min(1, 0.4 + Math.abs(player.vx) / 10) : 0);
+  }
 
-    const marble = ctx.createLinearGradient(0, FLOOR_Y, 0, WORLD_H);
-    marble.addColorStop(0, "#f4e6c8");
-    marble.addColorStop(0.35, "#e7d3aa");
-    marble.addColorStop(1, "#b88958");
-    ctx.fillStyle = marble;
-    ctx.fillRect(0, FLOOR_Y, WORLD_W, WORLD_H - FLOOR_Y);
-    ctx.strokeStyle = "rgba(90, 140, 110, 0.25)";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(0, FLOOR_Y + 46);
-    ctx.bezierCurveTo(280, FLOOR_Y + 20, 640, FLOOR_Y + 80, WORLD_W, FLOOR_Y + 36);
-    ctx.stroke();
-    ctx.fillStyle = "#e2b15a";
-    ctx.fillRect(0, FLOOR_Y, WORLD_W, 8);
-    ctx.fillStyle = "#8d3148";
-    ctx.fillRect(0, FLOOR_Y + 8, WORLD_W, 3);
-
+  /** A soft shadow on whatever Olive would land on, to judge the drop. */
+  function drawShadow(ctx: CanvasRenderingContext2D, cx: number, feet: number) {
+    let below: Platform | null = null;
     for (const p of PLATFORMS) {
-      if (p.kind !== "tree") continue;
-      const img = p.side === "left" ? perchL : perchR;
-      const stand = p.side === "left" ? LEFT_STAND : RIGHT_STAND;
-      const dw = p.w * 1.06;
-      const dh = dw * (p.side === "left" ? 118 / 520 : 108 / 520);
-      const dx = p.x + p.w / 2 - dw / 2;
-      const dy = p.y - dh * stand;
-      ctx.drawImage(img, dx, dy, dw, dh);
+      if (p.y < feet - 1) continue;
+      if (cx + 16 < p.x || cx - 16 > p.x + p.w) continue;
+      if (!below || p.y < below.y) below = p;
     }
-
-    const sx = SUMMIT.x + SUMMIT.w * 0.62;
-    const sy = SUMMIT.y - 56 + Math.sin(time * 2.4) * 6;
-    ctx.save();
-    ctx.translate(sx, sy);
-    ctx.rotate(Math.sin(time * 1.6) * 0.05);
-    const glow = ctx.createRadialGradient(0, 0, 8, 0, 0, 54);
-    glow.addColorStop(0, "rgba(255, 186, 96, 0.55)");
-    glow.addColorStop(1, "rgba(255, 186, 96, 0)");
-    ctx.fillStyle = glow;
+    if (!below) return;
+    const h = below.y - feet;
+    const fade = Math.max(0, 1 - h / 520);
+    if (fade <= 0) return;
+    const y = below.y + scene.dipOf(below) * 0.3 + (below.kind === "floor" ? 2 : -1);
+    const rx = 30 * (0.55 + 0.45 * fade);
+    const g = ctx.createRadialGradient(cx, y, 0, cx, y, rx);
+    g.addColorStop(0, `rgba(12, 8, 14, ${0.42 * fade})`);
+    g.addColorStop(1, "rgba(12, 8, 14, 0)");
+    ctx.fillStyle = g;
     ctx.beginPath();
-    ctx.arc(0, 0, 54, 0, Math.PI * 2);
+    ctx.ellipse(cx, y, rx, rx * 0.22, 0, 0, TAU);
     ctx.fill();
-    const sw = 78;
-    ctx.drawImage(sushiImg, -sw / 2, -sw * 0.42, sw, sw * 0.84);
-    ctx.restore();
+  }
 
-    for (const puff of puffs) {
-      ctx.globalAlpha = Math.max(0, puff.life * 2.1);
-      ctx.fillStyle = puff.gold ? "#f0c36a" : "#f7edd9";
-      ctx.beginPath();
-      ctx.arc(puff.x, puff.y, puff.r, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.globalAlpha = 1;
-    }
-
-    const frame = sheets[player.anim][player.frame % sheets[player.anim].length]!;
-    const dh = 128;
-    const dw = dh * (frame.naturalWidth / frame.naturalHeight);
-    const feetX = player.x + player.w / 2;
-    const feetY = player.y + player.h;
-    const syScale = 1 + player.squash;
+  /** A small ring over Olive's back that drains while she glides. */
+  function drawGlideMeter(ctx: CanvasRenderingContext2D, cx: number, top: number) {
+    if (glideShow < 0.02) return;
+    const left = player.stamina / TUNING.glideStamina;
+    const x = cx - player.facing * 16;
+    const y = top - 46;
     ctx.save();
-    ctx.translate(feetX, feetY);
-    ctx.scale(player.facing * (2 - syScale), syScale);
-    if (player.grounded) {
-      ctx.fillStyle = "rgba(28, 24, 16, 0.22)";
-      ctx.beginPath();
-      ctx.ellipse(0, 3, 22, 6, 0, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    ctx.drawImage(frame, -dw / 2, -dh + 8, dw, dh);
+    ctx.globalAlpha = glideShow;
+    ctx.lineCap = "round";
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "rgba(20, 14, 10, 0.45)";
+    ctx.beginPath();
+    ctx.arc(x, y, 7, 0, TAU);
+    ctx.stroke();
+    ctx.strokeStyle = left > 0.3 ? "#fff1cf" : "#ff8a7a";
+    ctx.beginPath();
+    ctx.arc(x, y, 7, -Math.PI / 2, -Math.PI / 2 + TAU * left);
+    ctx.stroke();
     ctx.restore();
-    ctx.restore();
-
-    const sun = ctx.createRadialGradient(viewW * 0.5, viewH * 0.02, 10, viewW * 0.5, viewH * 0.22, viewH * 0.75);
-    sun.addColorStop(0, "rgba(255, 214, 150, 0.2)");
-    sun.addColorStop(0.45, "rgba(255, 196, 120, 0.05)");
-    sun.addColorStop(1, "rgba(255, 196, 120, 0)");
-    ctx.fillStyle = sun;
-    ctx.fillRect(0, 0, viewW, viewH);
   }
 
   function frameLoop(now: number) {
-    const delta = Math.min(0.05, (now - last) / 1000);
+    const raw = (now - last) / 1000;
+    const delta = Math.min(0.1, raw);
     last = now;
+    if (raw < 0.25) {
+      judged += raw;
+      if (raw > 1 / 45) slow += raw;
+      if (judged > 2) {
+        if (slow / judged > 0.5 && quality > 0.55) quality = Math.max(0.55, quality - 0.15);
+        judged = 0;
+        slow = 0;
+      }
+    }
     acc += delta;
     let guard = 0;
-    while (acc >= STEP && guard < 5) {
+    while (acc >= STEP && guard < 6) {
+      prev = { x: player.x, y: player.y, camX, camY };
       step(STEP);
       acc -= STEP;
       guard++;
     }
-    draw();
+    if (guard >= 6) acc = 0;
+    // A respawn or reset should not smear across the screen.
+    if (Math.abs(prev.y - player.y) > 200 || Math.abs(prev.x - player.x) > 200) {
+      prev = { x: player.x, y: player.y, camX, camY };
+    }
+    draw(acc / STEP, delta);
     window.__controlsTest = probe;
     raf = requestAnimationFrame(frameLoop);
   }
 
+  const gameKeys = new Set(Object.values(KEYS).flat());
   const onKeyDown = (e: KeyboardEvent) => {
-    if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
+    if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code))
+      e.preventDefault();
     real.add(e.code);
-    if (phase === "title" && !e.repeat) begin();
+    if (phase === "title" && !e.repeat && gameKeys.has(e.code)) begin();
+    else sound.unlock();
   };
   const onKeyUp = (e: KeyboardEvent) => {
     real.delete(e.code);
@@ -693,24 +391,45 @@ export async function startAtrium(
   window.addEventListener("blur", onBlur);
 
   const probe = {
-    getX: mineX,
+    getX: () => player.x,
     getY: () => player.y,
     getBottom: () => player.y + player.h,
     getGrounded: () => player.grounded,
     getYaw: () => player.facing,
     getSpeed: () => Math.abs(player.vx),
+    getVy: () => player.vy,
+    getGliding: () => player.gliding,
+    getPerch: () => (player.ground?.kind === "perch" ? player.ground.index + 1 : 0),
     setKeys: (codes: string[]) => {
       injected.clear();
       for (const c of codes) injected.add(c);
       if (phase === "title" && codes.length) begin();
     },
     getPhase: () => phase,
+    /** Test hook: stand Olive on a perch (1-based), or the floor with 0. */
+    warp: (perch: number) => {
+      const p = perch > 0 ? PLATFORMS[perch] : PLATFORMS[0];
+      if (!p) return;
+      player = makePlayer();
+      player.x = p.x + (p.kind === "floor" ? 300 : 20);
+      player.y = p.y - player.h;
+      player.ground = p;
+      player.onSolid = p.solid;
+      anchorY = p.y;
+      const { viewW, viewH } = viewSize();
+      const c = clampCam(player.x + lookX - viewW * 0.5, cameraYFor(anchorY, viewH), viewW, viewH);
+      camX = c.x;
+      camY = c.y;
+      prev = { x: player.x, y: player.y, camX, camY };
+    },
   };
   window.__controlsTest = probe;
 
   const { viewW, viewH } = viewSize();
-  camX = Math.max(0, Math.min(WORLD_W - viewW, player.x - viewW * 0.28));
-  camY = Math.max(0, Math.min(WORLD_H - viewH, player.y - viewH * 0.62));
+  const start = clampCam(player.x + lookX - viewW * 0.5, cameraYFor(anchorY, viewH), viewW, viewH);
+  camX = start.x;
+  camY = start.y;
+  prev = { x: player.x, y: player.y, camX, camY };
   onPhase("title");
   raf = requestAnimationFrame(frameLoop);
 
@@ -720,12 +439,14 @@ export async function startAtrium(
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", onBlur);
+      sound.close();
       if (window.__controlsTest === probe) delete window.__controlsTest;
     },
     setKey(code: string, down: boolean) {
       if (down) {
         real.add(code);
         if (phase === "title") begin();
+        else sound.unlock();
       } else real.delete(code);
     },
     start: begin,
